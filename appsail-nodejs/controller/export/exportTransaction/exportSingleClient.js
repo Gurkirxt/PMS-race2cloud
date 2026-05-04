@@ -163,7 +163,7 @@ export const exportTransactionPerAccount = async (req, res) => {
           return {
             rowId: "BON-" + b.ROWID,
             date: b.ExDate,
-            executionPriority: -3,
+            executionPriority: -2,
             type: "BONUS",
             securityName: b.SecurityName,
             securityCode: null,
@@ -198,7 +198,7 @@ export const exportTransactionPerAccount = async (req, res) => {
           return {
             rowId: "SPL-" + s.ROWID,
             date: s.Issue_Date,
-            executionPriority: -2,
+            executionPriority: -3,
             type: "SPLIT",
             securityName: s.Security_Name,
             securityCode: null,
