@@ -1,3 +1,16 @@
+/**
+ * Tie-breaker for events that share the same date.
+ * SPLIT must be processed BEFORE BONUS so that bonus shares (stored in the DB
+ * as the post-split count) are not multiplied a second time by the split.
+ */
+const EVENT_TYPE_PRIORITY = {
+  TXN: 0,
+  SPLIT: 1,
+  BONUS: 2,
+  DEMERGER: 3,
+  MERGER: 4,
+};
+
 exports.runFifoEngine = (
   transactions = [],
   bonuses = [],
@@ -81,7 +94,11 @@ exports.runFifoEngine = (
           isin: s.isin,
         },
       })),
-  ].sort((a, b) => new Date(a.date) - new Date(b.date));
+  ].sort((a, b) => {
+    const dateDiff = new Date(a.date) - new Date(b.date);
+    if (dateDiff !== 0) return dateDiff;
+    return (EVENT_TYPE_PRIORITY[a.type] ?? 99) - (EVENT_TYPE_PRIORITY[b.type] ?? 99);
+  });
 
   /* ---------------- HELPERS ---------------- */
   const isSell = (t) => /^SL\+|SQS|OPO|NF-/.test(String(t).toUpperCase());
