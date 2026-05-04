@@ -298,6 +298,19 @@ async function fetchSplitsForIsins(zcql, isins, asOnDate) {
 
 /* ============================== FIFO ENGINE (mirror of analytics fifo.js) ============================== */
 
+/**
+ * Tie-breaker for events that share the same date.
+ * SPLIT must be processed BEFORE BONUS so that bonus shares (stored in the DB
+ * as the post-split count) are not multiplied a second time by the split.
+ */
+const EVENT_TYPE_PRIORITY = {
+  TXN: 0,
+  SPLIT: 1,
+  BONUS: 2,
+  DEMERGER: 3,
+  MERGER: 4,
+};
+
 function runFifoEngine(
   transactions = [],
   bonuses = [],
@@ -418,7 +431,11 @@ function runFifoEngine(
           },
         };
       }),
-  ].sort((a, b) => new Date(a.date) - new Date(b.date));
+  ].sort((a, b) => {
+    const dateDiff = new Date(a.date) - new Date(b.date);
+    if (dateDiff !== 0) return dateDiff;
+    return (EVENT_TYPE_PRIORITY[a.type] ?? 99) - (EVENT_TYPE_PRIORITY[b.type] ?? 99);
+  });
 
   const isSell = (t) => /^SL\+|SQS|OPO|NF-/.test(String(t).toUpperCase());
 
