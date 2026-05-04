@@ -26,7 +26,8 @@
       "UpdateISIN",
       "ExportCashBalSingleClient",
       "ExportCashBalance",
-      "MegerFn"
+      "MegerFn",
+      "CalculateHoldingPerAccount"
     ],
     "ignore": [],
     "source": "functions"

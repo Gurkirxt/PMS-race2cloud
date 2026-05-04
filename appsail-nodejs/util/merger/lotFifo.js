@@ -14,6 +14,19 @@
  *   - costPerShare: price per share carried at cutoff
  *   - totalCost:    qty × costPerShare
  */
+/**
+ * Tie-breaker for events that share the same date.
+ * SPLIT must be processed BEFORE BONUS so that bonus shares (stored in the DB
+ * as the post-split count) are not multiplied a second time by the split.
+ */
+const EVENT_TYPE_PRIORITY = {
+  TXN: 0,
+  SPLIT: 1,
+  BONUS: 2,
+  DEMERGER: 3,
+  MERGER: 4,
+};
+
 export function runLotFifo(
   transactions = [],
   bonuses = [],
@@ -152,7 +165,8 @@ export function runLotFifo(
   ].sort((a, b) => {
     const da = a.date ? new Date(a.date).getTime() : 0;
     const db = b.date ? new Date(b.date).getTime() : 0;
-    return da - db;
+    if (da !== db) return da - db;
+    return (EVENT_TYPE_PRIORITY[a.type] ?? 99) - (EVENT_TYPE_PRIORITY[b.type] ?? 99);
   });
 
   for (const e of events) {
