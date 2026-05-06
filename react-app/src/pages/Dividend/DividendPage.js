@@ -33,6 +33,12 @@ function DividendPage() {
   const [exportDownloadUrl, setExportDownloadUrl] = useState("");
   const [exportLoading, setExportLoading] = useState(false);
 
+  const [applyJobName, setApplyJobName] = useState(null);
+  const [applyStatus, setApplyStatus] = useState(null);
+
+  const [custodianFile, setCustodianFile] = useState(null);
+  const custodianInputRef = useRef(null);
+
   const dropdownRef = useRef(null);
 
   useEffect(() => setPage(1), [previewData]);
@@ -55,6 +61,77 @@ function DividendPage() {
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
+
+  /* ===========================
+     POLL DIVIDEND APPLY JOB STATUS
+     =========================== */
+  useEffect(() => {
+    if (!applyJobName || !loading) return;
+
+    const terminalStatuses = ["COMPLETED", "FAILED", "ERROR"];
+    if (terminalStatuses.includes(applyStatus)) return;
+
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch(
+          `${BASE_URL}/dividend/apply-status?jobName=${encodeURIComponent(applyJobName)}`,
+          { credentials: "include" },
+        );
+        const data = await res.json();
+        if (!data.success) return;
+
+        setApplyStatus(data.status);
+
+        if (data.status === "COMPLETED") {
+          clearInterval(interval);
+
+          const entry = {
+            securityCode: symbol,
+            securityName: companyName,
+            isin,
+            dividendType,
+            rate: rate || "-",
+            unit,
+            exDate,
+            recordDate: recordDate || "-",
+            paymentDate: paymentDate || "-",
+          };
+          setDividendList((prev) => [entry, ...prev]);
+          setSuccess(true);
+
+          setTimeout(() => {
+            setSuccess(false);
+            setExportDownloadUrl("");
+            setPreviewData([]);
+            setShowPreview(false);
+            setPreviewEmptyMessage("");
+            setSymbol("");
+            setSearchQuery("");
+            setCompanyName("");
+            setIsin("");
+            setRate("");
+            setExDate("");
+            setRecordDate("");
+            setPaymentDate("");
+            setLoading(false);
+            setApplyJobName(null);
+            setApplyStatus(null);
+          }, 3000);
+        } else if (data.status === "FAILED" || data.status === "ERROR") {
+          clearInterval(interval);
+          setError("Dividend application failed. Please try again.");
+          setLoading(false);
+          setApplyJobName(null);
+          setApplyStatus(null);
+        }
+      } catch {
+        /* ignore polling errors */
+      }
+    }, 10000);
+
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [applyJobName, loading, applyStatus]);
 
   const fetchAllSecurities = async () => {
     try {
@@ -161,7 +238,14 @@ function DividendPage() {
     if (exportDownloadUrl) window.open(exportDownloadUrl, "_blank");
   };
 
-  /** Apply dividend (called from preview section after fetch) */
+  /**
+   * Apply dividend (called from preview section after fetch).
+   *
+   * Submits a Catalyst Job via the AppSail controller. The controller returns
+   * { jobName, status: "PENDING" } immediately; the polling useEffect above
+   * then polls /dividend/apply-status until COMPLETED / FAILED / ERROR.
+   * `loading` stays true for the entire duration so the button shows "Applying…".
+   */
   const handleApply = async () => {
     setError(null);
     if (!symbol || !companyName || !recordDate || !paymentDate) {
@@ -183,6 +267,8 @@ function DividendPage() {
       dividendType,
     };
     setLoading(true);
+    setApplyStatus(null);
+    setApplyJobName(null);
     try {
       const res = await fetch(`${BASE_URL}/dividend/apply`, {
         method: "POST",
@@ -190,42 +276,16 @@ function DividendPage() {
         body: JSON.stringify(payload),
       });
       const data = await res.json();
-      if (!data.success) {
+      if (!data.success || !data.jobName) {
         setError(data.message || "Failed to apply dividend");
+        setLoading(false);
         return;
       }
-      const entry = {
-        securityCode: symbol,
-        securityName: companyName,
-        isin,
-        dividendType,
-        rate: rate || "-",
-        unit,
-        exDate,
-        recordDate: recordDate || "-",
-        paymentDate: paymentDate || "-",
-      };
-      setDividendList((prev) => [entry, ...prev]);
-      setSuccess(true);
-      setTimeout(() => {
-        setSuccess(false);
-        setExportDownloadUrl("");
-        setPreviewData([]);
-        setShowPreview(false);
-        setPreviewEmptyMessage("");
-        setSymbol("");
-        setSearchQuery("");
-        setCompanyName("");
-        setIsin("");
-        setRate("");
-        setExDate("");
-        setRecordDate("");
-        setPaymentDate("");
-      }, 3000);
+      setApplyJobName(data.jobName);
+      setApplyStatus(data.status || "PENDING");
     } catch (err) {
       console.error(err);
       setError("Failed to apply dividend");
-    } finally {
       setLoading(false);
     }
   };
@@ -383,6 +443,48 @@ function DividendPage() {
           </div>
 
           <div className="dividend-actions">
+            <input
+              type="file"
+              accept=".csv,.xlsx,.xls"
+              ref={custodianInputRef}
+              style={{ display: "none" }}
+              onChange={(e) => {
+                setCustodianFile(e.target.files?.[0] || null);
+                if (e.target) e.target.value = "";
+              }}
+            />
+            <button
+              type="button"
+              className="dividend-preview-btn"
+              style={{ marginRight: 12 }}
+              onClick={() => custodianInputRef.current?.click()}
+            >
+              Upload Custodian File
+            </button>
+
+            {custodianFile && (
+              <span
+                style={{
+                  marginRight: 12,
+                  fontSize: 13,
+                  color: "#374151",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 6,
+                }}
+              >
+                {custodianFile.name}
+                <span
+                  role="button"
+                  aria-label="Remove file"
+                  style={{ cursor: "pointer", color: "#dc2626", fontWeight: 700 }}
+                  onClick={() => setCustodianFile(null)}
+                >
+                  ✕
+                </span>
+              </span>
+            )}
+
             <button
               type="button"
               className="dividend-preview-btn"

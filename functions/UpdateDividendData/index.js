@@ -1,41 +1,29 @@
 /**
  * UpdateDividendData (Catalyst job function)
  *
- * Port of `applyStockDividendMaster` from
- * appsail-nodejs/controller/uploader/DividendUploader.js
+ * Triggered as a background job by the AppSail controller
+ * `applyStockDividendMaster` (DividendUploader.js) via
+ * `jobScheduling.JOB.submitJob({ target_name: "UpdateDividendData", ... })`.
+ *
+ * Job params (all required, supplied by the controller):
+ *   isin, securityCode, securityName, rate, exDate, recordDate,
+ *   paymentDate, dividendType, jobName
  *
  * What it does:
- *   1. Idempotency check on (ISIN, RecordDate) in `Dividend`.
- *   2. INSERT one master row into `Dividend`.
- *   3. Discover all accounts that ever traded the ISIN.
- *   4. Fetch Transaction / Bonus / Split rows ≤ RecordDate for the ISIN.
- *   5. Run FIFO engine per account (card mode) to get holding-on-record-date.
- *   6. INSERT one row into `Dividend_Record` per eligible account.
- *
- * Inputs are read from jobRequest args. If absent, TEST_CONFIG is used so the
- * function can be triggered manually for testing the same way you tested
- * Cal_CB_Per_TNX / CalculateHoldingPerAccount.
- *
- * The AppSail controller is intentionally NOT touched. This function is a
- * standalone implementation that can be invoked independently.
+ *   1. INSERT a row into `Jobs` (status='PENDING') keyed by jobName so the
+ *      React UI can poll `/dividend/apply-status?jobName=...`.
+ *   2. Idempotency check on (ISIN, RecordDate) in `Dividend`.
+ *   3. INSERT one master row into `Dividend`.
+ *   4. Discover all accounts that ever traded the ISIN.
+ *   5. Fetch Transaction / Bonus / Split rows ≤ RecordDate for the ISIN.
+ *   6. Run FIFO engine per account (card mode) to get holding-on-record-date.
+ *   7. INSERT one row into `Dividend_Record` per eligible account.
+ *   8. APPEND one row into `Cash_Balance_Per_Transaction` per eligible
+ *      account (running balance + monotonic Sequence per account).
+ *   9. UPDATE the `Jobs` row to status='COMPLETED' (or 'FAILED' on error).
  */
 
 const catalyst = require("zcatalyst-sdk-node");
-
-/* =========================================================================
-   CONFIG — used as fallback when job args are not provided.
-   Edit these to test against a specific dividend, then redeploy.
-   ========================================================================= */
-const TEST_CONFIG = {
-  isin: "",
-  securityCode: "",
-  securityName: "",
-  rate: 0,
-  exDate: "",
-  recordDate: "",
-  paymentDate: "",
-  dividendType: "Interim",
-};
 
 const ZCQL_ROW_LIMIT = 270;
 
@@ -497,33 +485,36 @@ function runFifoEngine(
 module.exports = async (jobRequest, context) => {
   const catalystApp = catalyst.initialize(context);
   const zcql = catalystApp.zcql();
-
-  const safeArg = (name) => {
-    try {
-      if (jobRequest && typeof jobRequest.getArgValue === "function") {
-        return jobRequest.getArgValue(name);
-      }
-    } catch (e) {
-      /* ignore */
-    }
-    return null;
-  };
+  let jobName = "";
 
   try {
-    /* ---- 1. Resolve inputs (job args fall back to TEST_CONFIG) ---- */
-    const isin = safeArg("isin") || TEST_CONFIG.isin;
-    const securityCode = safeArg("securityCode") || TEST_CONFIG.securityCode;
-    const securityName = safeArg("securityName") || TEST_CONFIG.securityName;
-    const rateRaw = safeArg("rate") ?? TEST_CONFIG.rate;
-    const exDate = safeArg("exDate") || TEST_CONFIG.exDate;
-    const recordDate = safeArg("recordDate") || TEST_CONFIG.recordDate;
-    const paymentDate = safeArg("paymentDate") || TEST_CONFIG.paymentDate;
-    const dividendType = safeArg("dividendType") || TEST_CONFIG.dividendType;
+    console.log("UpdateDividendData job started");
 
-    const rate = Number(rateRaw);
+    /* ---- 1. Resolve inputs from job params (controller always supplies these) ---- */
+    const params = jobRequest.getAllJobParams();
+    const {
+      isin,
+      securityCode,
+      securityName,
+      exDate,
+      recordDate,
+      paymentDate,
+      dividendType,
+    } = params;
+    const rate = Number(params.rate);
+    jobName = params.jobName;
 
     if (!Number.isFinite(rate) || rate <= 0) {
-      console.error("UpdateDividendData: invalid dividend rate ->", rateRaw);
+      console.error("UpdateDividendData: invalid dividend rate ->", params.rate);
+      if (jobName) {
+        try {
+          await zcql.executeZCQLQuery(
+            `UPDATE Jobs SET status = 'FAILED' WHERE jobName = '${jobName}'`
+          );
+        } catch (e) {
+          console.error("Failed to mark job FAILED on validation error:", e);
+        }
+      }
       context.closeWithFailure();
       return;
     }
@@ -535,9 +526,23 @@ module.exports = async (jobRequest, context) => {
         recordDate,
         paymentDate,
       });
+      if (jobName) {
+        try {
+          await zcql.executeZCQLQuery(
+            `UPDATE Jobs SET status = 'FAILED' WHERE jobName = '${jobName}'`
+          );
+        } catch (e) {
+          console.error("Failed to mark job FAILED on validation error:", e);
+        }
+      }
       context.closeWithFailure();
       return;
     }
+
+    /* ---- 1b. Insert PENDING row in Jobs so /apply-status can be polled ---- */
+    await zcql.executeZCQLQuery(
+      `INSERT INTO Jobs (jobName, status) VALUES ('${jobName}', 'PENDING')`
+    );
 
     const recordDateISO = normalizeDate(recordDate);
     const exDateISO = exDate && String(exDate).trim()
@@ -561,6 +566,9 @@ module.exports = async (jobRequest, context) => {
     if (existing && existing.length > 0) {
       console.warn(
         `Dividend already exists for ISIN=${isin} RecordDate=${recordDateISO}. Skipping master insert and per-account allocation.`,
+      );
+      await zcql.executeZCQLQuery(
+        `UPDATE Jobs SET status = 'COMPLETED' WHERE jobName = '${jobName}'`
       );
       context.closeWithSuccess();
       return;
@@ -614,6 +622,9 @@ module.exports = async (jobRequest, context) => {
 
     if (eligibleAccounts.length === 0) {
       console.log("No eligible accounts. Job complete (master row inserted only).");
+      await zcql.executeZCQLQuery(
+        `UPDATE Jobs SET status = 'COMPLETED' WHERE jobName = '${jobName}'`
+      );
       context.closeWithSuccess();
       return;
     }
@@ -708,7 +719,9 @@ module.exports = async (jobRequest, context) => {
      *          - Otherwise read the last row for the account (ORDER BY Sequence DESC),
      *            insert a new row with Sequence=lastSeq+1 and
      *            Cash_Balance=lastBalance+dividendAmount.
-     *          - Tran Date = RecordDate, Set Date = PaymentDate.
+     *          - Tran Date = RecordDate, Set Date = RecordDate (both store/display
+     *            the record date so the Cash Passbook UI shows the dividend's
+     *            entitlement date in both date columns).
      * ---- */
     let insertedCount = 0;
     let skippedNoTxn = 0;
@@ -793,7 +806,7 @@ module.exports = async (jobRequest, context) => {
                 '${esc(accountCode)}',
                 'DIVIDEND',
                 '${recordDateISO}',
-                '${paymentDateISO}',
+                '${recordDateISO}',
                 ${rate},
                 ${newBalance},
                 '${esc(securityCode)}',
@@ -826,9 +839,21 @@ module.exports = async (jobRequest, context) => {
         `CashRows inserted=${cashInsertedCount}, CashRows skipped(dup)=${cashSkippedDup}, CashRows errors=${cashErrors}`,
     );
 
+    await zcql.executeZCQLQuery(
+      `UPDATE Jobs SET status = 'COMPLETED' WHERE jobName = '${jobName}'`
+    );
     context.closeWithSuccess();
   } catch (error) {
     console.error("UpdateDividendData failed:", error);
+    if (jobName) {
+      try {
+        await zcql.executeZCQLQuery(
+          `UPDATE Jobs SET status = 'FAILED' WHERE jobName = '${jobName}'`
+        );
+      } catch (updateErr) {
+        console.error("Failed to update job status to FAILED:", updateErr);
+      }
+    }
     context.closeWithFailure();
   }
 };

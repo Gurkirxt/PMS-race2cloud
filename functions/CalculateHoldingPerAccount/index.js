@@ -30,8 +30,7 @@ const catalyst = require("zcatalyst-sdk-node");
 /* ============================== CONFIG ============================== */
 
 /** Non-empty array = process only these WS_Account_code values; empty = all accounts found in Transaction. */
-const ACCOUNTS_FILTER = ["NROAYAN03","AYAN008","NROAYAN01","AYAN021","AYAN019","AYAN003","AYAN029","AYAN028","AYAN030","AYAN015"];
-
+const ACCOUNTS_FILTER = ["AYAN168","HCAYAN035","ELAYAN038","AYAN171","TAYAN020","221NREAYAN","HCAYAN038","AYAN170","243NREAYAN","AYAN175"];
 /** Non-empty array = process only these ISINs (within selected accounts); empty = all ISINs for the account. */
 const ISINS_FILTER = [];
 
