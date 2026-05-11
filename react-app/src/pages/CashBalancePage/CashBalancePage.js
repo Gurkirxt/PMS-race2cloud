@@ -114,7 +114,7 @@ function CashBalancePage() {
 
         setRows(json.data || []);
         setTotalCount(json.totalCount || 0);
-        setCurrentPage(page);
+        setCurrentPage(json.page != null ? json.page : page);
         setFetched(true);
       } catch (err) {
         console.error("Cash passbook fetch error:", err);
@@ -136,9 +136,10 @@ function CashBalancePage() {
 
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
 
+  /* API returns newest-first; closing balance = balance after latest txn on this page */
   const closingBalance = useMemo(() => {
     if (!rows.length) return null;
-    return rows[rows.length - 1];
+    return rows[0];
   }, [rows]);
 
   const [exportJobName, setExportJobName] = useState("");
@@ -486,7 +487,7 @@ function CashBalancePage() {
                         className="cash-page-btn"
                         disabled={currentPage <= 1}
                         onClick={() => fetchData(1)}
-                        title="First"
+                        title="Newest transactions"
                       >
                         «
                       </button>
@@ -494,6 +495,7 @@ function CashBalancePage() {
                         className="cash-page-btn"
                         disabled={currentPage <= 1}
                         onClick={() => fetchData(currentPage - 1)}
+                        title="Newer"
                       >
                         Prev
                       </button>
@@ -542,6 +544,7 @@ function CashBalancePage() {
                         className="cash-page-btn"
                         disabled={currentPage >= totalPages}
                         onClick={() => fetchData(currentPage + 1)}
+                        title="Older"
                       >
                         Next
                       </button>
@@ -549,7 +552,7 @@ function CashBalancePage() {
                         className="cash-page-btn"
                         disabled={currentPage >= totalPages}
                         onClick={() => fetchData(totalPages)}
-                        title="Last"
+                        title="Oldest transactions"
                       >
                         »
                       </button>

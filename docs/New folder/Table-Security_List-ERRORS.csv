@@ -1,0 +1,4 @@
+"Row-Number","Security_Code","ISIN","Security_Name","Catalyst-ERRORS"
+"136","TDSACCOUNT","null","Tax Deducted at Source","Duplicate value for ISIN. Please give a different value"
+"204","OTHERINCOME","null","Other Income","Duplicate value for ISIN. Please give a different value"
+"228","INE547G01019","null","LUMAX AUTOMOTIVE SYSTEMS LTD","Duplicate value for ISIN. Please give a different value"

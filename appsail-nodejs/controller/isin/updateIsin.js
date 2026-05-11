@@ -122,6 +122,7 @@ export const postUpdateIsin = async (req, res) => {
       target_name: "UpdateISIN",
       target_type: "Function",
       params: {
+        mode: "rename",
         old_isin: oldTrim,
         new_isin: newTrim,
       },
@@ -141,6 +142,89 @@ export const postUpdateIsin = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: error?.message || "Failed to queue ISIN update",
+    });
+  }
+};
+
+/**
+ * POST /api/isin/apply-new
+ * Queues the UpdateISIN job in "apply-new" mode (the "New ISIN" panel):
+ * syncs Security_Code / Security_Name for the given ISIN across Security_List
+ * and Transaction. Per-column rule:
+ *   - Skip rows where the value already equals the new value.
+ *   - Update everywhere else (NULL, empty, or different).
+ */
+export const postApplyNewISIN = async (req, res) => {
+  try {
+    if (!req.catalystApp) {
+      return res.status(500).json({
+        success: false,
+        message: "Catalyst not initialized",
+      });
+    }
+
+    const { isin, securityCode, securityName } = req.body || {};
+    const isinTrim = String(isin ?? "").trim();
+    const codeTrim = String(securityCode ?? "").trim();
+    const nameTrim = String(securityName ?? "").trim();
+
+    if (!isinTrim) {
+      return res.status(400).json({
+        success: false,
+        message: "ISIN is required.",
+      });
+    }
+    if (!codeTrim && !nameTrim) {
+      return res.status(400).json({
+        success: false,
+        message: "Provide at least one of Security Code or Security Name.",
+      });
+    }
+
+    const zcql = req.catalystApp.zcql();
+    const existsRows = await zcql.executeZCQLQuery(`
+      SELECT ROWID
+      FROM Security_List
+      WHERE ISIN='${escSql(isinTrim)}'
+      LIMIT 1
+    `);
+    if (!existsRows?.length) {
+      return res.status(400).json({
+        success: false,
+        message: "ISIN must exist in Security List.",
+      });
+    }
+
+    const catalystApp = req.catalystApp;
+    const catalystJobName = `N${Date.now()}`.slice(0, 20);
+
+    const submitted = await catalystApp.jobScheduling().JOB.submitJob({
+      job_name: catalystJobName,
+      jobpool_name: UPDATE_ISIN_JOBPOOL,
+      target_name: "UpdateISIN",
+      target_type: "Function",
+      params: {
+        mode: "apply-new",
+        isin: isinTrim,
+        security_code: codeTrim,
+        security_name: nameTrim,
+      },
+    });
+
+    const jobId = submitted?.job_id ?? submitted?.jobId ?? null;
+
+    return res.status(200).json({
+      success: true,
+      message:
+        "New ISIN apply queued; Security_Code / Security_Name will be updated where missing or different.",
+      catalystJobName,
+      jobId,
+    });
+  } catch (error) {
+    console.error("[postApplyNewISIN]", error);
+    return res.status(500).json({
+      success: false,
+      message: error?.message || "Failed to queue New ISIN apply",
     });
   }
 };

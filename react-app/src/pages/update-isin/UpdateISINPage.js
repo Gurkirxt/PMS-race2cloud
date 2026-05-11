@@ -236,36 +236,31 @@ const UpdateISINPage = () => {
     }
   };
 
-  /** Bottom panel: uses Old ISIN from top + list-matched NEW ISIN + manual code/name (same API for now). */
+  /**
+   * Bottom panel: syncs Security_Code / Security_Name for the selected ISIN
+   * across Security_List + Transaction. Per column: skip if already same,
+   * otherwise update (handles NULL, empty, or different existing values).
+   */
   const handleApply = async () => {
     setApplyBanner(null);
 
-    const oldTrim = oldIsin.trim();
-    const newTrim = panelNewIsin.trim();
+    const isinTrim = panelNewIsin.trim();
     const codeTrim = newSecurityCode.trim();
     const nameTrim = newSecurityName.trim();
 
-    if (!oldTrim || !newTrim) {
+    if (!isinTrim) {
       setApplyStatus("failure");
       setApplyBanner({
         kind: "error",
-        text: "Old ISIN (above) and NEW ISIN are required to apply.",
+        text: "ISIN is required.",
       });
       return;
     }
-    if (!codeTrim || !nameTrim) {
+    if (!codeTrim && !nameTrim) {
       setApplyStatus("failure");
       setApplyBanner({
         kind: "error",
-        text: "NEW Security Code and NEW Security Name are required.",
-      });
-      return;
-    }
-    if (oldTrim === newTrim) {
-      setApplyStatus("failure");
-      setApplyBanner({
-        kind: "error",
-        text: "Old ISIN and NEW ISIN must be different.",
+        text: "Provide at least one of Security Code or Security Name.",
       });
       return;
     }
@@ -279,20 +274,11 @@ const UpdateISINPage = () => {
       return;
     }
 
-    if (securityListIsins.length > 0 && !isinByKey.get(oldTrim.toUpperCase())) {
+    if (securityListIsins.length > 0 && !isinByKey.get(isinTrim.toUpperCase())) {
       setApplyStatus("failure");
       setApplyBanner({
         kind: "error",
-        text: "Old ISIN must match Security List (use the Update Script section above).",
-      });
-      return;
-    }
-
-    if (securityListIsins.length > 0 && !isinByKey.get(newTrim.toUpperCase())) {
-      setApplyStatus("failure");
-      setApplyBanner({
-        kind: "error",
-        text: "NEW ISIN must match Security List. Type the full ISIN or pick a suggestion.",
+        text: "ISIN must match Security List. Type the full ISIN or pick a suggestion.",
       });
       return;
     }
@@ -300,11 +286,15 @@ const UpdateISINPage = () => {
     setApplyStatus("in_progress");
 
     try {
-      const res = await fetch(`${ISIN_API_BASE}/isin/update`, {
+      const res = await fetch(`${ISIN_API_BASE}/isin/apply-new`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
-        body: JSON.stringify({ oldIsin: oldTrim, newIsin: newTrim }),
+        body: JSON.stringify({
+          isin: isinTrim,
+          securityCode: codeTrim,
+          securityName: nameTrim,
+        }),
       });
       const data = await res.json().catch(() => ({}));
 
@@ -313,12 +303,14 @@ const UpdateISINPage = () => {
       }
 
       const jobId = data?.jobId ?? data?.job_id;
-      console.log("Apply ISIN job submitted, jobId:", jobId);
+      console.log("ApplyNewISIN job submitted, jobId:", jobId);
 
       setApplyStatus("completed");
       setApplyBanner({
         kind: "success",
-        text: "Apply queued successfully. The database will be updated shortly.",
+        text:
+          data?.message ||
+          "New ISIN apply queued. Security_Code / Security_Name will be updated where missing or different.",
       });
     } catch (err) {
       setApplyStatus("failure");
@@ -527,8 +519,8 @@ const UpdateISINPage = () => {
         <div className="update-isin-card update-isin-card--stack">
           <h3>New ISIN</h3>
           <p className="update-isin-hint">
-            Pick NEW ISIN from the Security List, enter NEW Security Code and NEW Security Name,
-            then Apply. Uses the Old ISIN from Update Script above.
+            Pick NEW ISIN from the Security List, enter NEW Security Code and/or NEW Security
+            Name, then Apply.
           </p>
 
           <div className="update-isin-apply-row">

@@ -19,9 +19,6 @@ import IsinRouter from "./router/IsinRouter.js";
 import DemergerRouter from "./router/DemergerRouter.js";
 import MergerRouter from "./router/MergerRouter.js";
 
-app.use(cors());
-app.use(Express.json());
-app.use(Express.urlencoded({ extended: true }));
 app.use(
   cors({
     origin: "http://localhost:3000",
@@ -30,6 +27,8 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
 );
+app.use(Express.json());
+app.use(Express.urlencoded({ extended: true }));
 
 app.use((req, res, next) => {
   try {

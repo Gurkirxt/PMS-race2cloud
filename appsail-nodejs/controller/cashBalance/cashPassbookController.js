@@ -61,7 +61,6 @@ export const getCashPassbook = async (req, res) => {
 
     const pg = Math.max(1, parseInt(page, 10) || 1);
     const size = Math.min(100, Math.max(1, parseInt(pageSize, 10) || 25));
-    const offset = (pg - 1) * size;
 
     let conditions = `Account_Code = '${accountCode}'`;
 
@@ -92,20 +91,41 @@ export const getCashPassbook = async (req, res) => {
       countRow["COUNT(ROWID)"] ?? countRow.cnt ?? countRow["count"] ?? Object.values(countRow)[0] ?? 0
     );
 
+    const totalPages = Math.max(1, Math.ceil(totalCount / size));
+    const pgClamped = Math.min(pg, totalPages);
+
     /* ── Paise helpers: do all math in integers to avoid float drift ── */
     const toPaise = (n) => Math.round(n * 100);
     const fromPaise = (p) => Number((p / 100).toFixed(2));
 
-    /* ── Compute carry-forward balance from all rows BEFORE this page ── */
-    let carryBalP = 0;   // balance in paise
+    if (totalCount === 0) {
+      return res.json({
+        data: [],
+        totalCount: 0,
+        page: 1,
+        pageSize: size,
+        totalPages: 1,
+      });
+    }
 
-    if (offset > 0) {
+    /*
+     * Pagination: page 1 = newest transactions (last chunk by Sequence ASC).
+     * Balance is always computed forward in time; response rows are newest-first for the UI.
+     */
+    const highIdx = totalCount - 1 - (pgClamped - 1) * size;
+    const lowIdx = Math.max(0, highIdx - size + 1);
+    const pageRowCount = highIdx - lowIdx + 1;
+
+    /* ── Carry: balance after all rows with index < lowIdx (chronologically before this slice) ── */
+    let carryBalP = 0;
+
+    if (lowIdx > 0) {
       const CARRY_BATCH = 300;
       let carryOffset = 0;
       let isFirstRecord = true;
 
-      while (carryOffset < offset) {
-        const batchSize = Math.min(CARRY_BATCH, offset - carryOffset);
+      while (carryOffset < lowIdx) {
+        const batchSize = Math.min(CARRY_BATCH, lowIdx - carryOffset);
         const priorRows = await zcql.executeZCQLQuery(
           `SELECT Transaction_Type, Total_Amount, STT
            FROM Cash_Balance_Per_Transaction
@@ -137,29 +157,25 @@ export const getCashPassbook = async (req, res) => {
       }
     }
 
-    /* ── Fetch current page rows ── */
     const dataRows = await zcql.executeZCQLQuery(
       `SELECT ROWID, Account_Code, Transaction_Date, Settlement_Date, ISIN, Security_Name,
               Transaction_Type, Quantity, Price, Total_Amount, Cash_Balance, STT, Sequence
        FROM Cash_Balance_Per_Transaction
        WHERE ${conditions}
        ORDER BY Sequence ASC
-       LIMIT ${offset}, ${size}`
+       LIMIT ${lowIdx}, ${pageRowCount}`
     );
 
-    /* ── Compute running balance for current page (in paise) ── */
     let runBalP = carryBalP;
-    let isFirstRecord = (offset === 0);
+    let isFirstRecord = lowIdx === 0;
 
-    const data = dataRows.map((r) => {
+    const dataChrono = dataRows.map((r) => {
       const row = r.Cash_Balance_Per_Transaction || r;
       const tranType = row.Transaction_Type || "";
       const amount = Math.abs(Number(row.Total_Amount) || 0);
       const amtP = toPaise(amount);
       const sttP = toPaise(Math.abs(Number(row.STT) || 0));
 
-      // Update running balance in paise
-      const prevP = runBalP;
       if (isFirstRecord && tranType === "CS+") {
         runBalP = amtP - sttP;
         isFirstRecord = false;
@@ -170,9 +186,6 @@ export const getCashPassbook = async (req, res) => {
       }
 
       const computedBalance = fromPaise(runBalP);
-
-      // Debug log (temporary)
-      console.log(`[CB] ${tranType} | prev=₹${fromPaise(prevP)} amt=₹${fromPaise(amtP)} stt=₹${fromPaise(sttP)} => bal=₹${computedBalance}`);
 
       // Debit / Credit for display (show original amount)
       let debit = null;
@@ -203,21 +216,14 @@ export const getCashPassbook = async (req, res) => {
       };
     });
 
-    // Debug: log first 3 rows to verify what's being sent
-    console.log("[CB] FINAL RESPONSE (first 3 rows):", data.slice(0, 3).map(d => ({
-      type: d.Transaction_Type,
-      amount: d.Total_Amount,
-      stt: d.STT,
-      Cash_Balance: d.Cash_Balance,
-      debug_old_balance: d.debug_old_balance,
-    })));
+    const data = dataChrono.slice().reverse();
 
     return res.json({
       data,
       totalCount,
-      page: pg,
+      page: pgClamped,
       pageSize: size,
-      totalPages: Math.ceil(totalCount / size),
+      totalPages,
     });
   } catch (error) {
     console.error("Cash passbook fetch error:", error);
