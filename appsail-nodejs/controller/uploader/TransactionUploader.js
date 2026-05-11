@@ -1,7 +1,7 @@
 import { runFifoEngine } from "../../util/analytics/transactionHistory/FifoQty.js";
 import { PassThrough } from "stream";
 
-const BUCKET_NAME = "upload-data-bucket";
+const BUCKET_NAME = "client-transaction-files";
 
 const MAX_ZCQL_ROWS = 300;
 const esc = (s) => String(s).replace(/'/g, "''");
@@ -39,7 +39,7 @@ export const uploadTempTransactionFile = async (req, res) => {
     // 2️⃣ Upload file to Stratus
     const bucket = catalystApp.stratus().bucket(BUCKET_NAME);
 
-    const fileName = `temp-files/transactions/Txn-${Date.now()}-${file.name}`;
+    const fileName = `transactions/Txn-${Date.now()}-${file.name}`;
 
     const stream = new PassThrough();
 

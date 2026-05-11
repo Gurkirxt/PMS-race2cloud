@@ -28,7 +28,8 @@
       "ExportCashBalance",
       "MegerFn",
       "CalculateHoldingPerAccount",
-      "UpdateDividendData"
+      "UpdateDividendData",
+      "DemergerFn"
     ],
     "ignore": [],
     "source": "functions"

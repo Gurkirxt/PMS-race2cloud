@@ -1,12 +1,255 @@
-import { runFifoEngine } from "../../util/analytics/transactionHistory/fifo.js";
+/**
+ * Demerger controller — lot-level (line-by-line) implementation.
+ *
+ * Source of truth for surviving lots is the materialized `Holdings` table
+ * (normally maintained by `functions/CalculateHoldingPerAccount`). We walk Holdings rows
+ * for each (account, oldIsin) pair to derive each surviving FIFO lot, then
+ * compute per-lot demerger math:
+ *
+ *   For each surviving lot:
+ *     oldRetainedQty   = lot.qty                                  (unchanged)
+ *     oldRetainedCost  = lot.qty * lot.price * (1 - pct/100)
+ *     oldRetainedWAP   = oldRetainedCost / lot.qty
+ *     newQty           = floor(lot.qty * r1 / r2)
+ *     newCost          = lot.qty * lot.price * (pct/100)
+ *     newWAP           = newCost / newQty
+ *
+ * Apply step writes:
+ *   1 row in `Demerger`        (header — single row per demerger event)
+ *   1 row in `Security_List`   (idempotent — new ISIN registered)
+ *   N×2 rows in `Demerger_Record` (per surviving lot: old-side + new-side)
+ *
+ * Each Demerger_Record row carries `Source_Tran_ROWID` linking back to the
+ * source Holdings ROWID — enables traceability + lossless re-computation.
+ *
+ * APPLY queues background job `DemergerFn`: inserts Demerger / Security_List /
+ * Demerger_Record then rebuilds Holdings for affected accounts inside that
+ * function (see `functions/DemergerFn/holdingsRebuildFromSources.js`, not CalculateHoldingPerAccount).
+ */
 
 const ZCQL_ROW_LIMIT = 270;
 
 const escSql = (s) => String(s ?? "").replace(/'/g, "''");
 
-/* ======================================================
-   PREVIEW DEMERGER (FIFO BASED)
-   ====================================================== */
+const round = (n, d = 2) => {
+  const f = Math.pow(10, d);
+  return Math.round(Number(n || 0) * f) / f;
+};
+
+const isBuyType = (t) => /^BY-|SQB|OPI/i.test(String(t || ""));
+const isSellType = (t) => /^SL\+|SQS|OPO|NF-/i.test(String(t || ""));
+const upperEq = (a, b) => String(a || "").trim().toUpperCase() === b;
+
+/* ====================================================================
+   FETCH: distinct accounts holding the old ISIN (from Holdings)
+   ==================================================================== */
+async function fetchAccountsHoldingIsin(zcql, isin) {
+  const accounts = new Set();
+  let offset = 0;
+  while (true) {
+    const batch = await zcql.executeZCQLQuery(`
+      SELECT WS_Account_code FROM Holdings
+      WHERE ISIN = '${escSql(isin)}'
+      ORDER BY ROWID ASC
+      LIMIT ${ZCQL_ROW_LIMIT} OFFSET ${offset}
+    `);
+    if (!batch || batch.length === 0) break;
+    for (const r of batch) {
+      const h = r.Holdings || r;
+      const code = String(h.WS_Account_code ?? "").trim();
+      if (code) accounts.add(code);
+    }
+    if (batch.length < ZCQL_ROW_LIMIT) break;
+    offset += ZCQL_ROW_LIMIT;
+  }
+  return [...accounts].sort((a, b) => a.localeCompare(b));
+}
+
+/* ====================================================================
+   FETCH: all Holdings rows for one (account, ISIN) ≤ recordDate
+   ==================================================================== */
+async function fetchHoldingRowsForPair(zcql, accountCode, isin, recordDateISO) {
+  const rows = [];
+  let offset = 0;
+  while (true) {
+    const batch = await zcql.executeZCQLQuery(`
+      SELECT ROWID, TRANSACTION_DATE, SETTLEMENT_DATE, TYPE, ISIN,
+             QUANTITY, PRICE, TOTAL_AMOUNT, HOLDING, WAP, HOLDING_VALUE, STATUS
+      FROM Holdings
+      WHERE WS_Account_code = '${escSql(accountCode)}'
+        AND ISIN = '${escSql(isin)}'
+        AND SETTLEMENT_DATE <= '${recordDateISO}'
+      ORDER BY SETTLEMENT_DATE ASC, ROWID ASC
+      LIMIT ${ZCQL_ROW_LIMIT} OFFSET ${offset}
+    `);
+    if (!batch || batch.length === 0) break;
+    for (const r of batch) rows.push(r.Holdings || r);
+    if (batch.length < ZCQL_ROW_LIMIT) break;
+    offset += ZCQL_ROW_LIMIT;
+  }
+  return rows;
+}
+
+/* ====================================================================
+   MINI-FIFO over Holdings rows → surviving lots
+   --------------------------------------------------------------------
+   Each Holdings row represents one FIFO event already materialized.
+   We walk in date order to derive each surviving lot's surviving qty
+   (Holdings rows alone do not carry surviving-qty after partial sells).
+   ==================================================================== */
+function computeSurvivingLotsFromHoldingRows(rows) {
+  let queue = []; // { qty, price, buyDate, sourceRowId, sourceType }
+  let lastReplaceEventKey = null;
+
+  for (const row of rows) {
+    const type = String(row.TYPE || "").trim();
+    const qty = Number(row.QUANTITY || 0);
+    const price = Number(row.PRICE || 0);
+    const buyDate = row.TRANSACTION_DATE || row.SETTLEMENT_DATE || null;
+    const sourceRowId = String(row.ROWID || "");
+
+    if (isBuyType(type)) {
+      if (qty > 0) {
+        queue.push({ qty, price, buyDate, sourceRowId, sourceType: type });
+      }
+      continue;
+    }
+
+    if (upperEq(type, "BONUS")) {
+      if (qty > 0) {
+        queue.push({ qty, price: 0, buyDate, sourceRowId, sourceType: "BONUS" });
+      }
+      continue;
+    }
+
+    if (isSellType(type)) {
+      let remaining = qty;
+      while (remaining > 0 && queue.length) {
+        const lot = queue[0];
+        const used = Math.min(lot.qty, remaining);
+        lot.qty -= used;
+        remaining -= used;
+        if (lot.qty <= 0) queue.shift();
+      }
+      continue;
+    }
+
+    if (upperEq(type, "SPLIT") || upperEq(type, "MERGER") || upperEq(type, "DEMERGER")) {
+      // SPLIT / MERGER / DEMERGER each produce one Holdings row per resulting lot.
+      // The first row of a new event wipes the prior queue; subsequent rows of the
+      // SAME event are added additively (one per resulting lot).
+      const eventKey = `${buyDate}|${type}`;
+      if (lastReplaceEventKey !== eventKey) {
+        queue = [];
+        lastReplaceEventKey = eventKey;
+      }
+      if (qty > 0) {
+        queue.push({ qty, price, buyDate, sourceRowId, sourceType: type });
+      }
+      continue;
+    }
+    // Other types (e.g. DIV+) have no holding effect — ignore.
+  }
+
+  return queue.filter((lot) => lot.qty > 0);
+}
+
+/* ====================================================================
+   LOT-LEVEL DEMERGER MATH for one account
+   ==================================================================== */
+function buildLotLevelDemergerForAccount({
+  accountCode,
+  lots,
+  oldIsin,
+  newIsin,
+  r1,
+  r2,
+  pct,
+}) {
+  const out = [];
+  for (const lot of lots) {
+    const Q1 = Number(lot.qty) || 0;
+    if (Q1 <= 0) continue;
+
+    const lotPrice = Number(lot.price) || 0;
+    const lotCost = Q1 * lotPrice;
+
+    const Q2 = Math.floor((Q1 * r1) / r2);
+    const newCost = lotCost * (pct / 100);
+    const oldCost = lotCost - newCost;
+
+    const oldWapAfter = Q1 > 0 ? oldCost / Q1 : 0;
+    const newWap = Q2 > 0 ? newCost / Q2 : 0;
+
+    out.push({
+      accountCode,
+      oldIsin,
+      sourceLotRowId: lot.sourceRowId,
+      sourceLotDate: lot.buyDate,
+      sourceLotType: lot.sourceType,
+      oldQty: Q1,
+      oldWapBefore: round(lotPrice, 4),
+      oldWapAfter: round(oldWapAfter, 4),
+      oldCostAfter: round(oldCost, 2),
+      newIsin,
+      newQty: Q2,
+      newWap: round(newWap, 4),
+      newCost: round(newCost, 2),
+    });
+  }
+  return out;
+}
+
+/* ====================================================================
+   INPUT VALIDATION (shared by preview + apply)
+   ==================================================================== */
+function validateDemergerInputs(body, requireApplyFields) {
+  const {
+    oldIsin,
+    newIsin,
+    ratio1,
+    ratio2,
+    effectiveDate,
+    recordDate,
+    allocationToNewPercent,
+  } = body;
+
+  const r1 = Number(ratio1);
+  const r2 = Number(ratio2);
+  const pct = Number(allocationToNewPercent);
+
+  if (
+    !oldIsin ||
+    !newIsin ||
+    oldIsin === newIsin ||
+    !effectiveDate ||
+    !recordDate ||
+    !Number.isFinite(r1) || r1 <= 0 ||
+    !Number.isFinite(r2) || r2 <= 0 ||
+    !Number.isFinite(pct) || pct < 0 || pct > 100
+  ) {
+    return { error: "Invalid input: check ISINs, ratio, dates and allocation %" };
+  }
+
+  if (requireApplyFields) {
+    const { oldSecurityCode, oldSecurityName, newSecurityCode, newSecurityName } = body;
+    if (!oldSecurityCode || !oldSecurityName || !newSecurityCode || !newSecurityName) {
+      return { error: "Missing required fields (security code/name)" };
+    }
+  }
+
+  return {
+    r1,
+    r2,
+    pct,
+    effectiveDateISO: new Date(effectiveDate).toISOString().split("T")[0],
+    recordDateISO: new Date(recordDate).toISOString().split("T")[0],
+  };
+}
+
+/* ====================================================================
+   PREVIEW (lot-level)
+   ==================================================================== */
 export const previewDemerger = async (req, res) => {
   try {
     if (!req.catalystApp) {
@@ -16,242 +259,88 @@ export const previewDemerger = async (req, res) => {
       });
     }
 
-    const {
-      oldIsin,
-      newIsin,
-      ratio1,
-      ratio2,
-      effectiveDate,
-      recordDate,
-      allocationToNewPercent,
-    } = req.body;
+    const v = validateDemergerInputs(req.body, false);
+    if (v.error) return res.status(400).json({ success: false, message: v.error });
 
-    const r1 = Number(ratio1);
-    const r2 = Number(ratio2);
-    const pct = Number(allocationToNewPercent);
-
-    if (
-      !oldIsin ||
-      !newIsin ||
-      oldIsin === newIsin ||
-      !effectiveDate ||
-      !recordDate ||
-      !Number.isFinite(r1) || r1 <= 0 ||
-      !Number.isFinite(r2) || r2 <= 0 ||
-      !Number.isFinite(pct) || pct < 0 || pct > 100
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid input: check ISINs, ratio, dates and allocation %",
-      });
-    }
-
-    const recordDateISO = new Date(recordDate).toISOString().split("T")[0];
-
+    const { oldIsin, newIsin } = req.body;
+    const { r1, r2, pct, recordDateISO } = v;
     const zcql = req.catalystApp.zcql();
 
-    /* ======================================================
-       STEP 1: FIND ACCOUNTS WITH TRANSACTIONS FOR OLD ISIN
-       ====================================================== */
-    const accountSet = new Set();
-    let holdOffset = 0;
+    const accounts = await fetchAccountsHoldingIsin(zcql, oldIsin);
+    if (!accounts.length) return res.json({ success: true, data: [] });
 
-    while (true) {
-      const batch = await zcql.executeZCQLQuery(`
-        SELECT WS_Account_code
-        FROM Transaction
-        WHERE ISIN='${escSql(oldIsin)}'
-        LIMIT ${ZCQL_ROW_LIMIT} OFFSET ${holdOffset}
-      `);
-
-      if (!batch || batch.length === 0) break;
-      batch.forEach((r) => accountSet.add(r.Transaction.WS_Account_code));
-      if (batch.length < ZCQL_ROW_LIMIT) break;
-      holdOffset += ZCQL_ROW_LIMIT;
-    }
-
-    const eligibleAccounts = Array.from(accountSet);
-
-    if (!eligibleAccounts.length) {
-      return res.json({ success: true, data: [] });
-    }
-
-    /* ======================================================
-       STEP 2: FETCH TRANSACTIONS FOR OLD ISIN (<= recordDate)
-       Same inclusive date logic as Bonus, Split, Dividend
-       ====================================================== */
-    const txRows = [];
-    const seenTxnRowIds = new Set();
-    let txOffset = 0;
-
-    while (true) {
-      const batch = await zcql.executeZCQLQuery(`
-        SELECT *
-        FROM Transaction
-        WHERE ISIN='${escSql(oldIsin)}'
-        AND SETDATE <= '${recordDateISO}'
-        ORDER BY SETDATE ASC, ROWID ASC
-        LIMIT ${ZCQL_ROW_LIMIT} OFFSET ${txOffset}
-      `);
-
-      if (!batch || batch.length === 0) break;
-      for (const row of batch) {
-        const t = row.Transaction || row;
-        const rowId = t.ROWID;
-        if (rowId != null && seenTxnRowIds.has(rowId)) continue;
-        if (rowId != null) seenTxnRowIds.add(rowId);
-        txRows.push(row);
-      }
-      if (batch.length < ZCQL_ROW_LIMIT) break;
-      txOffset += ZCQL_ROW_LIMIT;
-    }
-
-    /* ======================================================
-       STEP 3: FETCH BONUSES FOR OLD ISIN (<= recordDate)
-       ====================================================== */
-    const bonusRows = [];
-    const seenBonusRowIds = new Set();
-    let bonusOffset = 0;
-
-    while (true) {
-      const batch = await zcql.executeZCQLQuery(`
-        SELECT *
-        FROM Bonus
-        WHERE ISIN='${escSql(oldIsin)}'
-        AND ExDate <= '${recordDateISO}'
-        ORDER BY ExDate ASC, ROWID ASC
-        LIMIT ${ZCQL_ROW_LIMIT} OFFSET ${bonusOffset}
-      `);
-
-      if (!batch || batch.length === 0) break;
-      for (const row of batch) {
-        const b = row.Bonus || row;
-        const rowId = b.ROWID;
-        if (rowId != null && seenBonusRowIds.has(rowId)) continue;
-        if (rowId != null) seenBonusRowIds.add(rowId);
-        bonusRows.push(row);
-      }
-      if (batch.length < ZCQL_ROW_LIMIT) break;
-      bonusOffset += ZCQL_ROW_LIMIT;
-    }
-
-    /* ======================================================
-       STEP 4: FETCH SPLITS FOR OLD ISIN (<= recordDate)
-       ====================================================== */
-    const splitRows = [];
-    const seenSplitRowIds = new Set();
-    let splitOffset = 0;
-
-    while (true) {
-      const batch = await zcql.executeZCQLQuery(`
-        SELECT *
-        FROM Split
-        WHERE ISIN='${escSql(oldIsin)}'
-        AND Issue_Date <= '${recordDateISO}'
-        ORDER BY Issue_Date ASC, ROWID ASC
-        LIMIT ${ZCQL_ROW_LIMIT} OFFSET ${splitOffset}
-      `);
-
-      if (!batch || batch.length === 0) break;
-      for (const row of batch) {
-        const s = row.Split || row;
-        const rowId = s.ROWID;
-        if (rowId != null && seenSplitRowIds.has(rowId)) continue;
-        if (rowId != null) seenSplitRowIds.add(rowId);
-        splitRows.push(row);
-      }
-      if (batch.length < ZCQL_ROW_LIMIT) break;
-      splitOffset += ZCQL_ROW_LIMIT;
-    }
-
-    /* ======================================================
-       STEP 5: GROUP DATA BY ACCOUNT
-       ====================================================== */
-    const txByAccount = {};
-    txRows.forEach((r) => {
-      const t = r.Transaction;
-      (txByAccount[t.WS_Account_code] ||= []).push(t);
-    });
-
-    const bonusByAccount = {};
-    bonusRows.forEach((r) => {
-      const b = r.Bonus;
-      (bonusByAccount[b.WS_Account_code] ||= []).push(b);
-    });
-
-    const splits = splitRows.map((r) => {
-      const s = r.Split;
-      return {
-        issueDate: s.Issue_Date,
-        ratio1: Number(s.Ratio1) || 0,
-        ratio2: Number(s.Ratio2) || 0,
-        isin: s.ISIN,
-      };
-    });
-
-    /* ======================================================
-       STEP 6: DEMERGER PREVIEW PER ACCOUNT
-       ====================================================== */
     const preview = [];
+    let accountsWithSurvivingLots = 0;
+    let totalLots = 0;
 
-    for (const accountCode of eligibleAccounts) {
-      const transactions = txByAccount[accountCode] || [];
-      if (!transactions.length) continue;
+    for (const accountCode of accounts) {
+      const rows = await fetchHoldingRowsForPair(zcql, accountCode, oldIsin, recordDateISO);
+      if (!rows.length) continue;
 
-      const bonuses = bonusByAccount[accountCode] || [];
+      const lots = computeSurvivingLotsFromHoldingRows(rows);
+      if (!lots.length) continue;
 
-      const fifoBefore = runFifoEngine(transactions, bonuses, splits, true);
-      if (!fifoBefore || fifoBefore.holdings <= 0) continue;
-
-      const Q1 = fifoBefore.holdings;
-      const TOTAL_COST = fifoBefore.holdingValue;
-      const beforePrice = fifoBefore.averageCostOfHoldings;
-
-      const Q2 = Math.floor((Q1 * r1) / r2);
-      if (Q2 <= 0) continue;
-
-      const newCost = TOTAL_COST * (pct / 100);
-      const oldCost = TOTAL_COST - newCost;
-
-      preview.push({
+      const accountPreview = buildLotLevelDemergerForAccount({
         accountCode,
+        lots,
         oldIsin,
-        oldQty: Q1,
-        oldBeforePrice: Math.round(beforePrice * 100) / 100,
-        oldNewPrice: Math.round((oldCost / Q1) * 100) / 100,
         newIsin,
-        newQty: Q2,
-        newPrice: Math.round((newCost / Q2) * 100) / 100,
+        r1,
+        r2,
+        pct,
       });
+
+      if (accountPreview.length) {
+        accountsWithSurvivingLots++;
+        totalLots += accountPreview.length;
+        preview.push(...accountPreview);
+      }
     }
 
-    return res.json({ success: true, data: preview });
+    return res.json({
+      success: true,
+      data: preview,
+      summary: {
+        accounts: accountsWithSurvivingLots,
+        lots: totalLots,
+      },
+    });
   } catch (error) {
     console.error("Preview demerger error:", error);
-    return res.status(500).json({
-      success: false,
-      message: error.message,
-    });
+    return res.status(500).json({ success: false, message: error.message });
   }
 };
 
-/* ======================================================
-   APPLY DEMERGER
-   1. INSERT master row into `Demerger`
-   2. For each eligible account: run FIFO, compute new ISIN
-      data, INSERT row into `Demerger_Record`
-   ====================================================== */
+const DEMERGER_STALE_TIMEOUT_MS = 60 * 60 * 1000;
+
+const parseCatalystTime = (ct) => {
+  if (!ct) return 0;
+  const fixed = String(ct).replace(/:(\d{3})$/, ".$1");
+  const ms = new Date(fixed).getTime();
+  return Number.isNaN(ms) ? 0 : ms;
+};
+
+/** Deterministic jobName under Catalyst ~50-char limit (matches merger pattern). */
+function buildDemergerJobName(oldIsin, newIsin, recordDateIso) {
+  const trim = (s, n) => String(s || "").replace(/[^A-Za-z0-9]/g, "").slice(-n);
+  const date = String(recordDateIso || "").replace(/[^\d]/g, "");
+  return `DMG_${trim(oldIsin, 6)}_${trim(newIsin, 6)}_${date}`;
+}
+
+/* ====================================================================
+   APPLY → queue Catalyst job `DemergerFn`
+   ==================================================================== */
 export const applyDemerger = async (req, res) => {
   try {
-    const app = req.catalystApp;
-    if (!app) {
+    if (!req.catalystApp) {
       return res.status(500).json({
         success: false,
         message: "Catalyst app not initialized",
       });
     }
 
-    const zcql = app.zcql();
+    const v = validateDemergerInputs(req.body, true);
+    if (v.error) return res.status(400).json({ success: false, message: v.error });
 
     const {
       oldIsin,
@@ -260,362 +349,130 @@ export const applyDemerger = async (req, res) => {
       newIsin,
       newSecurityCode,
       newSecurityName,
-      ratio1,
-      ratio2,
-      effectiveDate,
-      recordDate,
-      allocationToNewPercent,
     } = req.body;
+    const { r1, r2, pct, effectiveDateISO, recordDateISO } = v;
 
-    if (
-      !oldIsin ||
-      !newIsin ||
-      oldIsin === newIsin ||
-      !oldSecurityCode ||
-      !oldSecurityName ||
-      !newSecurityCode ||
-      !newSecurityName ||
-      !ratio1 ||
-      !ratio2 ||
-      !effectiveDate ||
-      !recordDate
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Missing required fields",
-      });
-    }
+    const zcql = req.catalystApp.zcql();
+    const jobScheduling = req.catalystApp.jobScheduling();
 
-    const r1 = Number(ratio1);
-    const r2 = Number(ratio2);
-    const pct = Number(allocationToNewPercent);
+    const jobName = buildDemergerJobName(oldIsin, newIsin, recordDateISO);
 
-    if (
-      !Number.isFinite(r1) || r1 <= 0 ||
-      !Number.isFinite(r2) || r2 <= 0 ||
-      !Number.isFinite(pct) || pct < 0 || pct > 100
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid ratio or allocation %",
-      });
-    }
-
-    const dateISO = new Date(effectiveDate).toISOString().split("T")[0];
-    const recordDateISO = new Date(recordDate).toISOString().split("T")[0];
-
-    /* ======================================================
-       STEP 1: INSERT MASTER ROW INTO `Demerger`
-       ====================================================== */
-    await zcql.executeZCQLQuery(`
-      INSERT INTO Demerger
-      (
-        Old_ISIN,
-        Old_Security_Code,
-        Old_Security_Name,
-        New_ISIN,
-        New_Security_Code,
-        New_Security_Name,
-        Ratio1,
-        Ratio2,
-        Effective_Date,
-        Record_Date,
-        Allocation_To_New_Pct
-      )
-      VALUES
-      (
-        '${escSql(oldIsin)}',
-        '${escSql(oldSecurityCode)}',
-        '${escSql(oldSecurityName)}',
-        '${escSql(newIsin)}',
-        '${escSql(newSecurityCode)}',
-        '${escSql(newSecurityName)}',
-        ${r1},
-        ${r2},
-        '${dateISO}',
-        '${recordDateISO}',
-        ${pct}
-      )
+    const existing = await zcql.executeZCQLQuery(`
+      SELECT ROWID, status, CREATEDTIME FROM Jobs WHERE jobName = '${escSql(jobName)}' LIMIT 1
     `);
 
-    /* ======================================================
-       STEP 1b: INSERT NEW SECURITY INTO `Security_List`
-       ====================================================== */
-    try {
-      await zcql.executeZCQLQuery(`
-        INSERT INTO Security_List
-        (
-          Security_Code,
-          ISIN,
-          Security_Name
-        )
-        VALUES
-        (
-          '${escSql(newSecurityCode)}',
-          '${escSql(newIsin)}',
-          '${escSql(newSecurityName)}'
-        )
-      `);
-    } catch (secErr) {
-      console.warn("Security_List insert skipped (may already exist):", secErr.message);
-    }
+    if (existing?.length) {
+      const oldStatus = existing[0].Jobs.status;
+      const oldRowId = existing[0].Jobs.ROWID;
+      const createdTime = existing[0].Jobs.CREATEDTIME;
+      const jobAge = Date.now() - parseCatalystTime(createdTime);
+      const isStale = jobAge > DEMERGER_STALE_TIMEOUT_MS;
 
-    /* ======================================================
-       STEP 2: FIND ACCOUNTS HOLDING OLD ISIN
-       ====================================================== */
-    const accountSet = new Set();
-    let holdOffset = 0;
-
-    while (true) {
-      const batch = await zcql.executeZCQLQuery(`
-        SELECT WS_Account_code
-        FROM Transaction
-        WHERE ISIN='${escSql(oldIsin)}'
-        LIMIT ${ZCQL_ROW_LIMIT} OFFSET ${holdOffset}
-      `);
-
-      if (!batch || batch.length === 0) break;
-      batch.forEach((r) => accountSet.add(r.Transaction.WS_Account_code));
-      if (batch.length < ZCQL_ROW_LIMIT) break;
-      holdOffset += ZCQL_ROW_LIMIT;
-    }
-
-    const eligibleAccounts = Array.from(accountSet);
-
-    if (!eligibleAccounts.length) {
-      return res.status(200).json({
-        success: true,
-        message: "Demerger master saved. No accounts hold the old ISIN.",
-        recordsInserted: 0,
-      });
-    }
-
-    /* ======================================================
-       STEP 3: LOAD TRANSACTION + BONUS + SPLIT FOR OLD ISIN
-       Same inclusive date logic as Bonus, Split, Dividend
-       ====================================================== */
-    const txRows = [];
-    const seenTxnRowIds = new Set();
-    let txOffset = 0;
-
-    while (true) {
-      const batch = await zcql.executeZCQLQuery(`
-        SELECT *
-        FROM Transaction
-        WHERE ISIN='${escSql(oldIsin)}'
-        AND SETDATE <= '${recordDateISO}'
-        ORDER BY SETDATE ASC, ROWID ASC
-        LIMIT ${ZCQL_ROW_LIMIT} OFFSET ${txOffset}
-      `);
-
-      if (!batch || batch.length === 0) break;
-      for (const row of batch) {
-        const t = row.Transaction || row;
-        const rowId = t.ROWID;
-        if (rowId != null && seenTxnRowIds.has(rowId)) continue;
-        if (rowId != null) seenTxnRowIds.add(rowId);
-        txRows.push(row);
+      if (
+        (oldStatus === "PENDING" || oldStatus === "RUNNING") &&
+        !isStale
+      ) {
+        return res.json({
+          success: true,
+          jobName,
+          status: oldStatus,
+          message: "Demerger application is already in progress",
+        });
       }
-      if (batch.length < ZCQL_ROW_LIMIT) break;
-      txOffset += ZCQL_ROW_LIMIT;
-    }
 
-    const bonusRows = [];
-    const seenBonusRowIds = new Set();
-    let bonusOffset = 0;
-
-    while (true) {
-      const batch = await zcql.executeZCQLQuery(`
-        SELECT *
-        FROM Bonus
-        WHERE ISIN='${escSql(oldIsin)}'
-        AND ExDate <= '${recordDateISO}'
-        ORDER BY ExDate ASC, ROWID ASC
-        LIMIT ${ZCQL_ROW_LIMIT} OFFSET ${bonusOffset}
-      `);
-
-      if (!batch || batch.length === 0) break;
-      for (const row of batch) {
-        const b = row.Bonus || row;
-        const rowId = b.ROWID;
-        if (rowId != null && seenBonusRowIds.has(rowId)) continue;
-        if (rowId != null) seenBonusRowIds.add(rowId);
-        bonusRows.push(row);
+      try {
+        await zcql.executeZCQLQuery(`DELETE FROM Jobs WHERE ROWID = ${oldRowId}`);
+      } catch (delErr) {
+        console.error("[applyDemerger] Error deleting old job row:", delErr);
       }
-      if (batch.length < ZCQL_ROW_LIMIT) break;
-      bonusOffset += ZCQL_ROW_LIMIT;
     }
 
-    const splitRows = [];
-    const seenSplitRowIds = new Set();
-    let splitOffset = 0;
-
-    while (true) {
-      const batch = await zcql.executeZCQLQuery(`
-        SELECT *
-        FROM Split
-        WHERE ISIN='${escSql(oldIsin)}'
-        AND Issue_Date <= '${recordDateISO}'
-        ORDER BY Issue_Date ASC, ROWID ASC
-        LIMIT ${ZCQL_ROW_LIMIT} OFFSET ${splitOffset}
-      `);
-
-      if (!batch || batch.length === 0) break;
-      for (const row of batch) {
-        const s = row.Split || row;
-        const rowId = s.ROWID;
-        if (rowId != null && seenSplitRowIds.has(rowId)) continue;
-        if (rowId != null) seenSplitRowIds.add(rowId);
-        splitRows.push(row);
-      }
-      if (batch.length < ZCQL_ROW_LIMIT) break;
-      splitOffset += ZCQL_ROW_LIMIT;
-    }
-
-    /* ======================================================
-       STEP 4: GROUP BY ACCOUNT
-       ====================================================== */
-    const txByAccount = {};
-    txRows.forEach((r) => {
-      const t = r.Transaction;
-      (txByAccount[t.WS_Account_code] ||= []).push(t);
+    await jobScheduling.JOB.submitJob({
+      job_name: "ApplyDemerger",
+      jobpool_name: "Export",
+      target_name: "DemergerFn",
+      target_type: "Function",
+      params: {
+        jobName,
+        oldIsin,
+        oldSecurityCode,
+        oldSecurityName,
+        newIsin,
+        newSecurityCode,
+        newSecurityName,
+        ratio1: String(r1),
+        ratio2: String(r2),
+        allocationPct: String(pct),
+        effectiveDateIso: effectiveDateISO,
+        recordDateIso: recordDateISO,
+      },
     });
 
-    const bonusByAccount = {};
-    bonusRows.forEach((r) => {
-      const b = r.Bonus;
-      (bonusByAccount[b.WS_Account_code] ||= []).push(b);
-    });
-
-    const splits = splitRows.map((r) => {
-      const s = r.Split;
-      return {
-        issueDate: s.Issue_Date,
-        ratio1: Number(s.Ratio1) || 0,
-        ratio2: Number(s.Ratio2) || 0,
-        isin: s.ISIN,
-      };
-    });
-
-    /* ======================================================
-       STEP 5: COMPUTE & INSERT Demerger_Record PER ACCOUNT
-       (2 rows per account: old ISIN + new ISIN)
-       ====================================================== */
-    let recordsInserted = 0;
-
-    for (const accountCode of eligibleAccounts) {
-      const transactions = txByAccount[accountCode] || [];
-      if (!transactions.length) continue;
-
-      const bonuses = bonusByAccount[accountCode] || [];
-
-      const fifoBefore = runFifoEngine(transactions, bonuses, splits, true);
-      if (!fifoBefore || fifoBefore.holdings <= 0) continue;
-
-      const Q1 = fifoBefore.holdings;
-      const TOTAL_COST = fifoBefore.holdingValue;
-
-      const Q2 = Math.floor((Q1 * r1) / r2);
-      if (Q2 <= 0) continue;
-
-      const newCost = TOTAL_COST * (pct / 100);
-      const oldCost = TOTAL_COST - newCost;
-
-      const oldNewPrice = Math.round((oldCost / Q1) * 100) / 100;
-      const newPrice = Math.round((newCost / Q2) * 100) / 100;
-
-      const oldCostRounded = Math.round(oldCost * 100) / 100;
-      const newCostRounded = Math.round(newCost * 100) / 100;
-
-      /* --- Row 1: Old ISIN (cost reduced) --- */
-      await zcql.executeZCQLQuery(`
-        INSERT INTO Demerger_Record
-        (
-          WS_Account_code,
-          TRANDATE,
-          SETDATE,
-          Tran_Type,
-          ISIN,
-          Security_Code,
-          Security_Name,
-          QTY,
-          PRICE,
-          TOTAL_AMOUNT,
-          HOLDING,
-          WAP,
-          HOLDING_VALUE,
-          PL
-        )
-        VALUES
-        (
-          '${escSql(accountCode)}',
-          '${dateISO}',
-          '${dateISO}',
-          'DEMERGER',
-          '${escSql(oldIsin)}',
-          '${escSql(oldSecurityCode)}',
-          '${escSql(oldSecurityName)}',
-          ${Q1},
-          ${oldNewPrice},
-          ${oldCostRounded},
-          ${Q1},
-          ${oldNewPrice},
-          ${oldCostRounded},
-          0
-        )
-      `);
-
-      /* --- Row 2: New ISIN (new shares received) --- */
-      await zcql.executeZCQLQuery(`
-        INSERT INTO Demerger_Record
-        (
-          WS_Account_code,
-          TRANDATE,
-          SETDATE,
-          Tran_Type,
-          ISIN,
-          Security_Code,
-          Security_Name,
-          QTY,
-          PRICE,
-          TOTAL_AMOUNT,
-          HOLDING,
-          WAP,
-          HOLDING_VALUE,
-          PL
-        )
-        VALUES
-        (
-          '${escSql(accountCode)}',
-          '${dateISO}',
-          '${dateISO}',
-          'DEMERGER',
-          '${escSql(newIsin)}',
-          '${escSql(newSecurityCode)}',
-          '${escSql(newSecurityName)}',
-          ${Q2},
-          ${newPrice},
-          ${newCostRounded},
-          ${Q2},
-          ${newPrice},
-          ${newCostRounded},
-          0
-        )
-      `);
-
-      recordsInserted += 2;
-    }
-
-    return res.status(200).json({
+    return res.json({
       success: true,
-      message: "Demerger applied successfully",
-      recordsInserted,
+      jobName,
+      status: "PENDING",
+      message: "Demerger application job started",
     });
   } catch (error) {
     console.error("Error in applyDemerger:", error);
     return res.status(500).json({
       success: false,
-      message: "Failed to apply demerger",
+      message: error.message || "Failed to queue demerger apply",
+    });
+  }
+};
+
+export const getDemergerApplyStatus = async (req, res) => {
+  try {
+    if (!req.catalystApp) {
+      return res.status(500).json({
+        success: false,
+        message: "Catalyst app not initialized",
+      });
+    }
+    const zcql = req.catalystApp.zcql();
+
+    const { jobName } = req.query;
+    if (!jobName) {
+      return res.status(400).json({
+        success: false,
+        message: "jobName is required",
+      });
+    }
+
+    const result = await zcql.executeZCQLQuery(
+      `SELECT ROWID, status, CREATEDTIME FROM Jobs WHERE jobName = '${escSql(String(jobName))}' LIMIT 1`,
+    );
+
+    if (!result?.length) {
+      return res.json({ success: true, status: "NOT_STARTED" });
+    }
+
+    let status = result[0].Jobs.status;
+    const createdTime = result[0].Jobs.CREATEDTIME;
+    const jobAge = Date.now() - parseCatalystTime(createdTime);
+
+    if (
+      (status === "PENDING" || status === "RUNNING") &&
+      jobAge > DEMERGER_STALE_TIMEOUT_MS
+    ) {
+      try {
+        await zcql.executeZCQLQuery(
+          `UPDATE Jobs SET status = 'ERROR' WHERE jobName = '${escSql(String(jobName))}'`,
+        );
+        status = "ERROR";
+      } catch (updateErr) {
+        console.error("[getDemergerApplyStatus] Stale-mark failed:", updateErr);
+      }
+    }
+
+    return res.json({ success: true, status });
+  } catch (error) {
+    console.error("[getDemergerApplyStatus]", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Status check failed",
     });
   }
 };

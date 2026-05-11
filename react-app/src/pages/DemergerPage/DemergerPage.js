@@ -38,11 +38,13 @@ function DemergerPage() {
   const [formError, setFormError] = useState(null);
 
   const [previewData, setPreviewData] = useState([]);
+  const [previewSummary, setPreviewSummary] = useState({ accounts: 0, lots: 0 });
   const [previewLoading, setPreviewLoading] = useState(false);
   const [step, setStep] = useState("form");
 
   const [applying, setApplying] = useState(false);
   const [applySuccess, setApplySuccess] = useState(false);
+  const [applyStatus, setApplyStatus] = useState("");
 
   const PAGE_SIZE = 10;
   const [page, setPage] = useState(1);
@@ -54,10 +56,105 @@ function DemergerPage() {
   );
 
   const dropdownRef = useRef(null);
+  const applyPollRef = useRef(null);
+
+  const stopApplyPoll = useCallback(() => {
+    if (applyPollRef.current) {
+      clearInterval(applyPollRef.current);
+      applyPollRef.current = null;
+    }
+  }, []);
+
+  const resetFormAfterApply = useCallback(() => {
+    setOldIsin("");
+    setOldSecurityCode("");
+    setOldSecurityName("");
+    setSearchQuery("");
+    setNewIsin("");
+    setNewSecurityCode("");
+    setNewSecurityName("");
+    setRatio1("");
+    setRatio2("");
+    setEffectiveDate("");
+    setRecordDate("");
+    setCostSplitPercent("");
+    setPreviewData([]);
+    setPreviewSummary({ accounts: 0, lots: 0 });
+    setStep("form");
+    setApplySuccess(false);
+    setApplyStatus("");
+  }, []);
+
+  /**
+   * Poll /demerger/apply-status until COMPLETED / FAILED / ERROR.
+   */
+  const startApplyPoll = useCallback(
+    (jobName) => {
+      stopApplyPoll();
+      const POLL_INTERVAL_MS = 3000;
+      const MAX_POLL_ATTEMPTS = 200;
+      let attempts = 0;
+
+      const tick = async () => {
+        attempts += 1;
+        try {
+          const url = `${BASE_URL}/demerger/apply-status?jobName=${encodeURIComponent(jobName)}`;
+          const res = await fetch(url);
+          const data = await res.json().catch(() => ({}));
+          if (!data?.success) {
+            setFormError(data?.message || `Status check failed (HTTP ${res.status})`);
+            stopApplyPoll();
+            setApplying(false);
+            return;
+          }
+          const status = String(data.status || "").toUpperCase();
+          setApplyStatus(status);
+
+          if (status === "COMPLETED") {
+            stopApplyPoll();
+            setApplying(false);
+            setApplySuccess(true);
+            setTimeout(() => {
+              resetFormAfterApply();
+            }, 2500);
+            return;
+          }
+          if (status === "FAILED" || status === "ERROR") {
+            stopApplyPoll();
+            setApplying(false);
+            setFormError(
+              status === "FAILED"
+                ? "Demerger application failed. Check DemergerFn logs in Catalyst."
+                : "Demerger job is stale or errored. Try again.",
+            );
+            return;
+          }
+          if (attempts >= MAX_POLL_ATTEMPTS) {
+            stopApplyPoll();
+            setApplying(false);
+            setFormError(
+              "Demerger is taking longer than expected. Check Catalyst job logs or refresh.",
+            );
+          }
+        } catch (e) {
+          stopApplyPoll();
+          setApplying(false);
+          setFormError(e.message || "Status check error");
+        }
+      };
+
+      tick();
+      applyPollRef.current = setInterval(tick, POLL_INTERVAL_MS);
+    },
+    [stopApplyPoll, resetFormAfterApply],
+  );
+
+  useEffect(() => () => stopApplyPoll(), [stopApplyPoll]);
 
   const clearStatus = useCallback(() => {
     setFormError(null);
     setApplySuccess(false);
+    setApplyStatus("");
   }, []);
 
   useEffect(() => {
@@ -161,6 +258,14 @@ function DemergerPage() {
 
       if (data.success) {
         setPreviewData(data.data || []);
+        setPreviewSummary(
+          data.summary && typeof data.summary === "object"
+            ? {
+                accounts: Number(data.summary.accounts) || 0,
+                lots: Number(data.summary.lots) || 0,
+              }
+            : { accounts: 0, lots: (data.data || []).length },
+        );
         setStep("preview");
       } else {
         setFormError(data.message || "Preview failed");
@@ -174,7 +279,13 @@ function DemergerPage() {
 
   const handleApply = async () => {
     clearStatus();
+    if (!previewData.length) {
+      setFormError("Fetch preview first.");
+      return;
+    }
+
     setApplying(true);
+    setApplyStatus("PENDING");
 
     try {
       const res = await fetch(`${BASE_URL}/demerger/apply`, {
@@ -197,32 +308,26 @@ function DemergerPage() {
 
       const data = await res.json();
 
-      if (data.success) {
-        setApplySuccess(true);
-        setTimeout(() => {
-          setOldIsin("");
-          setOldSecurityCode("");
-          setOldSecurityName("");
-          setSearchQuery("");
-          setNewIsin("");
-          setNewSecurityCode("");
-          setNewSecurityName("");
-          setRatio1("");
-          setRatio2("");
-          setEffectiveDate("");
-          setRecordDate("");
-          setCostSplitPercent("");
-          setPreviewData([]);
-          setStep("form");
-          setApplySuccess(false);
-        }, 2000);
-      } else {
+      if (!data.success) {
         setFormError(data.message || "Apply failed");
+        setApplying(false);
+        setApplyStatus("");
+        return;
       }
+
+      const jn = data.jobName;
+      if (!jn) {
+        setFormError("Apply queued but no jobName returned.");
+        setApplying(false);
+        setApplyStatus("");
+        return;
+      }
+
+      startApplyPoll(jn);
     } catch (err) {
       setFormError(err.message || "Network error");
-    } finally {
       setApplying(false);
+      setApplyStatus("");
     }
   };
 
@@ -231,17 +336,13 @@ function DemergerPage() {
     const headers = [
       "Account Code",
       "Old ISIN",
+      "Source Buy Date",
       "Old Qty",
-      "Old Before Price",
-      "Old After Price",
+      "Old WAP (Before)",
+      "Old WAP (After)",
       "New ISIN",
       "New Qty",
-      "New Price",
-      "Effective Date",
-      "Record Date",
-      "Ratio 1",
-      "Ratio 2",
-      "Allocation to new (%)",
+      "New WAP",
     ];
     const lines = [headers.map(escapeCsvCell).join(",")];
     for (const row of previewData) {
@@ -249,17 +350,13 @@ function DemergerPage() {
         [
           row.accountCode,
           row.oldIsin,
+          row.sourceLotDate,
           row.oldQty,
-          row.oldBeforePrice,
-          row.oldNewPrice,
+          row.oldWapBefore,
+          row.oldWapAfter,
           row.newIsin,
           row.newQty,
-          row.newPrice,
-          effectiveDate,
-          recordDate,
-          ratio1,
-          ratio2,
-          costSplitPercent,
+          row.newWap,
         ]
           .map(escapeCsvCell)
           .join(","),
@@ -279,15 +376,7 @@ function DemergerPage() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-  }, [
-    previewData,
-    effectiveDate,
-    recordDate,
-    ratio1,
-    ratio2,
-    costSplitPercent,
-    newIsin,
-  ]);
+  }, [previewData, recordDate, newIsin]);
 
   return (
     <MainLayout title="Demerger">
@@ -300,7 +389,16 @@ function DemergerPage() {
           )}
           {formError && <div className="alert error">{formError}</div>}
           {applySuccess && (
-            <div className="alert success">Demerger applied successfully!</div>
+            <div className="alert success">
+              Demerger applied successfully. Holdings table has been rebuilt for affected
+              accounts.
+            </div>
+          )}
+          {applying && applyStatus && !applySuccess && (
+            <div className="alert info">
+              Background job status: <strong>{applyStatus}</strong>
+              {" — "}DemergerFn is writing Demerger_Record and rebuilding Holdings.
+            </div>
           )}
 
           <div className="split-card">
@@ -523,7 +621,7 @@ function DemergerPage() {
           ) : (
             <>
               <div className="demerger-preview-header-row">
-                <h3>Demerger Impact Preview</h3>
+                <h3>Demerger Impact Preview (lot-level)</h3>
                 <div className="bonus-preview-actions">
                   <button
                     type="button"
@@ -535,31 +633,46 @@ function DemergerPage() {
                 </div>
               </div>
 
+              <div
+                className="alert info"
+                style={{ marginBottom: 8, fontSize: 13 }}
+              >
+                <strong>{previewSummary.accounts}</strong> account
+                {previewSummary.accounts === 1 ? "" : "s"} affected ·{" "}
+                <strong>{previewSummary.lots}</strong> surviving lot
+                {previewSummary.lots === 1 ? "" : "s"} — queued apply writes lot-level rows to{" "}
+                <code>Demerger_Record</code> and refreshes <code>Holdings</code> via DemergerFn.
+              </div>
+
               <div className="bonus-preview-table-wrapper">
                 <table className="bonus-preview-table">
                   <thead>
                     <tr>
                       <th>Account Code</th>
                       <th>Old ISIN</th>
+                      <th>Source Buy Date</th>
                       <th>Old Qty</th>
-                      <th>Old Before Price</th>
-                      <th>Old After Price</th>
+                      <th>Old WAP (Before)</th>
+                      <th>Old WAP (After)</th>
                       <th>New ISIN</th>
                       <th>New Qty</th>
-                      <th>New Price</th>
+                      <th>New WAP</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {paginatedPreview.map((row) => (
-                      <tr key={row.accountCode}>
+                    {paginatedPreview.map((row, idx) => (
+                      <tr
+                        key={`${row.accountCode}-${row.sourceLotRowId || idx}`}
+                      >
                         <td>{row.accountCode}</td>
                         <td>{row.oldIsin}</td>
+                        <td>{row.sourceLotDate}</td>
                         <td>{row.oldQty}</td>
-                        <td>{row.oldBeforePrice}</td>
-                        <td>{row.oldNewPrice}</td>
+                        <td>{row.oldWapBefore}</td>
+                        <td>{row.oldWapAfter}</td>
                         <td>{row.newIsin}</td>
                         <td>{row.newQty}</td>
-                        <td>{row.newPrice}</td>
+                        <td>{row.newWap}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -592,7 +705,7 @@ function DemergerPage() {
                   disabled={applying}
                   onClick={handleApply}
                 >
-                  {applying ? "Applying Demerger..." : "Confirm & Apply Demerger"}
+                  {applying ? "Applying (background job)…" : "Confirm & Apply Demerger"}
                 </button>
               </div>
             </>

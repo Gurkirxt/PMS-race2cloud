@@ -9,17 +9,22 @@ const esc = (v) => String(v ?? "").replace(/'/g, "''");
 const isValid = (v) =>
   v != null && v !== "" && String(v).toLowerCase() !== "null";
 
-/** Only process transaction CSV uploads from these Stratus key prefixes. */
-const ALLOWED_CSV_PREFIXES = [
-  "temp-files/temp-transactions/",
-  "temp-files/transactions/",
-];
+/** Only process transaction CSV uploads landing in this single bucket + prefix. */
+const ALLOWED_BUCKET = "client-transaction-files";
+const ALLOWED_KEY_PREFIX = "transactions/";
+
+function isAllowedBucket(bucketName) {
+  return (
+    typeof bucketName === "string" &&
+    bucketName.toLowerCase() === ALLOWED_BUCKET.toLowerCase()
+  );
+}
 
 function isAllowedObjectKey(key) {
   if (!key || typeof key !== "string") return false;
   const lower = key.toLowerCase();
   if (!lower.endsWith(".csv")) return false;
-  return ALLOWED_CSV_PREFIXES.some((p) => lower.startsWith(p.toLowerCase()));
+  return lower.startsWith(ALLOWED_KEY_PREFIX.toLowerCase());
 }
 
 function parseRawEvent(event) {
@@ -227,28 +232,20 @@ function createCsvParser() {
 
 /**
  * Stream CSV via csv-parser (handles quoted commas/newlines). Accumulate unique
- * clientIds + Security_List keys in Maps, then flush with ensure*.
+ * accountCodes + ISINs as Sets, then flush with ensure*.
+ *
+ * Transaction CSV → masters mapping (strict):
+ *   - clientIds.WS_Account_code ← BROKERACID | WS_Account_code (same value; bulk rewrite renames header)
+ *   - Security_List.ISIN        ← SYMBOLCODE | ISIN
+ *
+ * No Security_Code / Security_Name / WS_client_id is ever inserted from this flow.
  */
 async function processCsvObjectForMasters(bucket, objectKey, zcql) {
-  const clients = new Map();
-  const securities = new Map();
+  const accountCodes = new Set();
+  const isins = new Set();
   let dataRowCount = 0;
 
   const mergeRow = (row) => {
-    /*
-     * Upload columns (Stratus transaction CSV) → masters:
-     * - clientIds: WS_client_id ← Broker Code | WS_client_id ; WS_Account_code ← BROKERACID
-     * - Security_List: ISIN ← SYMBOLCODE ; Security_Code ← SYMBOLCODE (else CASHSYMBOLCODE) ;
-     *   Security_Name ← Description | Security_Name
-     */
-    const wsClientId = getCell(
-      row,
-      "Broker Code",
-      "broker code",
-      "brokercode",
-      "WS_client_id",
-      "ws_client_id",
-    );
     const wsAccountCode = getCell(
       row,
       "BROKERACID",
@@ -257,63 +254,9 @@ async function processCsvObjectForMasters(bucket, objectKey, zcql) {
       "ws_account_code",
     );
     const isin = getCell(row, "SYMBOLCODE", "symbolcode", "ISIN", "isin");
-    const securityCode = getCell(
-      row,
-      "SYMBOLCODE",
-      "symbolcode",
-      "CASHSYMBOLCODE",
-      "cashsymbolcode",
-      "Security_Code",
-      "security_code",
-    );
-    const securityName = getCell(
-      row,
-      "Description",
-      "description",
-      "Security_Name",
-      "security_name",
-    );
 
-    if (isValid(wsAccountCode)) {
-      const lookupId = isValid(wsClientId) ? wsClientId : wsAccountCode;
-      const cur = clients.get(wsAccountCode);
-      if (!cur) {
-        clients.set(wsAccountCode, {
-          wsClientId: lookupId,
-          wsAccountCode,
-        });
-      } else if (
-        cur.wsClientId === wsAccountCode &&
-        isValid(wsClientId) &&
-        wsClientId !== wsAccountCode
-      ) {
-        cur.wsClientId = wsClientId;
-      }
-    }
-
-    if (!isValid(securityCode) && !isValid(isin)) return;
-
-    const secKey = isValid(isin) ? `i:${isin}` : `c:${securityCode}`;
-    const prev = securities.get(secKey);
-    if (!prev) {
-      securities.set(secKey, {
-        securityCode: isValid(securityCode) ? securityCode : "",
-        isin: isValid(isin) ? isin : "",
-        securityName: isValid(securityName) ? securityName : "",
-      });
-    } else {
-      if (
-        securityName &&
-        (!prev.securityName ||
-          securityName.length > (prev.securityName || "").length)
-      ) {
-        prev.securityName = securityName;
-      }
-      if (isValid(securityCode) && !isValid(prev.securityCode)) {
-        prev.securityCode = securityCode;
-      }
-      if (isValid(isin) && !isValid(prev.isin)) prev.isin = isin;
-    }
+    if (isValid(wsAccountCode)) accountCodes.add(wsAccountCode);
+    if (isValid(isin)) isins.add(isin);
   };
 
   const raw = await bucket.getObject(objectKey);
@@ -348,21 +291,24 @@ async function processCsvObjectForMasters(bucket, objectKey, zcql) {
   console.log(
     "[UpdateSecurity_ClientMaster] Parsed",
     objectKey,
-    `dataRows=${dataRowCount} uniqueClients=${clients.size} uniqueSecurities=${securities.size}`,
+    `dataRows=${dataRowCount} uniqueAccountCodes=${accountCodes.size} uniqueIsins=${isins.size}`,
   );
 
-  for (const c of clients.values()) {
-    await ensureClientIds(zcql, c.wsClientId, c.wsAccountCode);
+  for (const wsAccountCode of accountCodes) {
+    await ensureClientIds(zcql, wsAccountCode);
   }
-  for (const s of securities.values()) {
-    await ensureSecurityList(zcql, s.securityCode, s.isin, s.securityName);
+  for (const isin of isins) {
+    await ensureSecurityList(zcql, isin);
   }
 }
 
-async function ensureClientIds(zcql, wsClientId, wsAccountCode) {
+/**
+ * Insert into clientIds with ONLY WS_Account_code (from BROKERACID or pre-rewritten WS_Account_code).
+ * Transaction CSV does not carry a separate client id, so WS_client_id is intentionally
+ * left untouched. Existing rows are not modified.
+ */
+async function ensureClientIds(zcql, wsAccountCode) {
   if (!isValid(wsAccountCode)) return;
-
-  const lookupId = isValid(wsClientId) ? wsClientId : wsAccountCode;
 
   const existingClient = await zcql.executeZCQLQuery(`
     SELECT ROWID FROM clientIds
@@ -372,8 +318,8 @@ async function ensureClientIds(zcql, wsClientId, wsAccountCode) {
   if (!existingClient.length) {
     try {
       await zcql.executeZCQLQuery(`
-        INSERT INTO clientIds (WS_client_id, WS_Account_code)
-        VALUES ('${esc(lookupId)}', '${esc(wsAccountCode)}')
+        INSERT INTO clientIds (WS_Account_code)
+        VALUES ('${esc(wsAccountCode)}')
       `);
     } catch (err) {
       if (String(err?.message || "").includes("Duplicate")) return;
@@ -382,42 +328,28 @@ async function ensureClientIds(zcql, wsClientId, wsAccountCode) {
   }
 }
 
-async function ensureSecurityList(zcql, securityCode, isin, securityName) {
-  if (!isValid(securityCode) && !isValid(isin)) return;
+/**
+ * Insert into Security_List with ONLY ISIN (from SYMBOLCODE or pre-rewritten ISIN column).
+ * Transaction CSV does not carry security_code / security_name, so those columns are
+ * intentionally left untouched on insert. Existing rows (matched by ISIN) are not modified.
+ */
+async function ensureSecurityList(zcql, isin) {
+  if (!isValid(isin)) return;
 
-  let exists = false;
+  const byIsin = await zcql.executeZCQLQuery(`
+    SELECT ROWID FROM Security_List
+    WHERE ISIN = '${esc(isin)}'
+  `);
+  if (byIsin.length) return;
 
-  if (isValid(isin)) {
-    const byIsin = await zcql.executeZCQLQuery(`
-      SELECT ROWID FROM Security_List
-      WHERE ISIN = '${esc(isin)}'
+  try {
+    await zcql.executeZCQLQuery(`
+      INSERT INTO Security_List (ISIN)
+      VALUES ('${esc(isin)}')
     `);
-    if (byIsin.length) exists = true;
-  }
-
-  if (!exists && isValid(securityCode)) {
-    const byCode = await zcql.executeZCQLQuery(`
-      SELECT ROWID FROM Security_List
-      WHERE Security_Code = '${esc(securityCode)}'
-    `);
-    if (byCode.length) exists = true;
-  }
-
-  if (!exists) {
-    const codeToInsert = isValid(securityCode) ? securityCode : (isin || "");
-    try {
-      await zcql.executeZCQLQuery(`
-        INSERT INTO Security_List (Security_Code, ISIN, Security_Name)
-        VALUES (
-          '${esc(codeToInsert)}',
-          '${esc(isin || "")}',
-          '${esc(securityName || "")}'
-        )
-      `);
-    } catch (err) {
-      if (String(err?.message || "").includes("Duplicate")) return;
-      throw err;
-    }
+  } catch (err) {
+    if (String(err?.message || "").includes("Duplicate")) return;
+    throw err;
   }
 }
 
@@ -446,6 +378,14 @@ module.exports = async (event, context) => {
     const zcql = catalystApp.zcql();
 
     for (const { bucket, keys } of jobs) {
+      if (!isAllowedBucket(bucket)) {
+        console.log(
+          "[UpdateSecurity_ClientMaster] Skip bucket (not allowed):",
+          bucket,
+        );
+        continue;
+      }
+
       const stratusBucket = catalystApp.stratus().bucket(bucket);
       for (const objectKey of keys) {
         if (!isAllowedObjectKey(objectKey)) {

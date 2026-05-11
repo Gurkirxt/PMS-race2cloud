@@ -1,7 +1,7 @@
 import csv from "csv-parser";
 import { PassThrough, Readable } from "stream";
 
-const BUCKET_NAME = "temporary-files";
+const BUCKET_NAME = "client-transaction-files";
 const TABLE_NAME = "Transaction";
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -279,7 +279,7 @@ function parseTempTransactionSampleRows(fileBuffer) {
  * 2. Validates the CSV parses and has at least one data row.
  * 3. Validates date columns on the first 3 data rows (blank / 0 / null allowed when empty).
  * 4. Rewrites CSV: maps template headers to Transaction columns (HEADER_MAP), tab → comma, trim cells.
- * 5. Uploads rewritten CSV to Stratus under temp-files/temp-transactions/.
+ * 5. Uploads rewritten CSV to Stratus bucket client-transaction-files under transactions/.
  * 6. Triggers a Catalyst Bulk Write Job to insert into the Transaction table.
  */
 export const uploadTempTransaction = async (req, res) => {
@@ -377,7 +377,7 @@ export const uploadTempTransaction = async (req, res) => {
     const rewrittenCsv = normalizeCsvForBulkUpload(file.data);
 
     const bucket = catalystApp.stratus().bucket(BUCKET_NAME);
-    const objectKey = `temp-files/temp-transactions/TxnUpload-${Date.now()}-${file.name}`;
+    const objectKey = `transactions/TxnUpload-${Date.now()}-${file.name}`;
 
     const passThrough = new PassThrough();
     const uploadPromise = bucket.putObject(objectKey, passThrough, {
