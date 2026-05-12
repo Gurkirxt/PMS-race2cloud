@@ -13,6 +13,19 @@ function formatINR(val) {
   return n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
+/*
+ * Resolve the visual tone for a Tran Type cell. Used to colour the
+ * inline badge in the table so DIVIDEND / BY- / SL+ etc. stand out.
+ */
+function tranTypeBadgeClass(tt) {
+  if (tt === "DIVIDEND") return "tt-badge tt-badge-dividend";
+  if (tt === "BY-") return "tt-badge tt-badge-buy";
+  if (tt === "SL+") return "tt-badge tt-badge-sell";
+  if (["CS+", "CSI", "IN+", "IN1"].includes(tt)) return "tt-badge tt-badge-cashin";
+  if (tt === "CS-") return "tt-badge tt-badge-cashout";
+  return "tt-badge tt-badge-default";
+}
+
 function CashBalancePage() {
   const { clientOptions } = useAccountCodes();
 
@@ -461,7 +474,15 @@ function CashBalancePage() {
                               <td>{r.Account_Code || "–"}</td>
                               <td>{r.ISIN || "–"}</td>
                               <td className="cash-col-name">{r.Security_Name || "–"}</td>
-                              <td>{r.Transaction_Type || "–"}</td>
+                              <td>
+                                {r.Transaction_Type ? (
+                                  <span className={tranTypeBadgeClass(r.Transaction_Type)}>
+                                    {r.Transaction_Type}
+                                  </span>
+                                ) : (
+                                  "–"
+                                )}
+                              </td>
                               <td>{r.Quantity ?? "–"}</td>
                               <td>{r.Price != null ? formatINR(r.Price) : "–"}</td>
                               <td className={Number(r.STT) ? "cash-debit" : ""}>

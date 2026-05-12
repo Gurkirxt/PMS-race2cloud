@@ -53,6 +53,7 @@ export const getCashPassbook = async (req, res) => {
       toDate,
       search,
       isin,
+      tranType,
     } = req.query;
 
     if (!accountCode) {
@@ -62,25 +63,55 @@ export const getCashPassbook = async (req, res) => {
     const pg = Math.max(1, parseInt(page, 10) || 1);
     const size = Math.min(100, Math.max(1, parseInt(pageSize, 10) || 25));
 
-    let conditions = `Account_Code = '${accountCode}'`;
+    /*
+     * baseConditions are the filters that don't change WHICH transactions
+     * exist in the running-balance walk. The carry walk for balance MUST
+     * use these (otherwise filtering by tranType would yield a balance
+     * that's just the sum of e.g. DIVIDEND rows, not the real cash position).
+     */
+    let baseConditions = `Account_Code = '${accountCode}'`;
 
     if (fromDate && /^\d{4}-\d{2}-\d{2}$/.test(fromDate)) {
-      conditions += ` AND Transaction_Date >= '${fromDate}'`;
+      baseConditions += ` AND Transaction_Date >= '${fromDate}'`;
     }
 
     if (toDate && /^\d{4}-\d{2}-\d{2}$/.test(toDate)) {
       const nextDay = new Date(toDate);
       nextDay.setDate(nextDay.getDate() + 1);
       const nextDayStr = nextDay.toISOString().split("T")[0];
-      conditions += ` AND Transaction_Date < '${nextDayStr}'`;
+      baseConditions += ` AND Transaction_Date < '${nextDayStr}'`;
     }
 
     if (isin && isin.trim()) {
       const i = isin.trim().replace(/'/g, "''");
-      conditions += ` AND ISIN = '${i}'`;
+      baseConditions += ` AND ISIN = '${i}'`;
     } else if (search && search.trim()) {
       const s = search.trim().replace(/'/g, "''");
-      conditions += ` AND (ISIN LIKE '%${s}%' OR Security_Name LIKE '%${s}%')`;
+      baseConditions += ` AND (ISIN LIKE '%${s}%' OR Security_Name LIKE '%${s}%')`;
+    }
+
+    /*
+     * conditions = baseConditions + optional tranType filter. Used for
+     * COUNT and the visible page slice. When a tranType filter is active
+     * we display the row's stored Cash_Balance (recorded at insert time)
+     * instead of recomputing — recomputing would walk only filtered rows
+     * and produce nonsense.
+     */
+    let conditions = baseConditions;
+    let tranTypeFilterActive = false;
+    if (tranType && tranType.trim()) {
+      const types = tranType
+        .split(",")
+        .map((t) => t.trim().replace(/'/g, "''"))
+        .filter(Boolean);
+      if (types.length === 1) {
+        conditions += ` AND Transaction_Type = '${types[0]}'`;
+        tranTypeFilterActive = true;
+      } else if (types.length > 1) {
+        const inList = types.map((t) => `'${t}'`).join(",");
+        conditions += ` AND Transaction_Type IN (${inList})`;
+        tranTypeFilterActive = true;
+      }
     }
 
     const countResult = await zcql.executeZCQLQuery(
@@ -116,6 +147,61 @@ export const getCashPassbook = async (req, res) => {
     const lowIdx = Math.max(0, highIdx - size + 1);
     const pageRowCount = highIdx - lowIdx + 1;
 
+    /*
+     * Carry-walk + page slice are only meaningful for the unfiltered view
+     * (or filters that don't change which rows exist — date / ISIN / search
+     * still preserve the chronological cash sequence). When the user filters
+     * by Transaction_Type we skip recomputation and just display the stored
+     * Cash_Balance, with a tranTypeFiltered flag so the UI can hint that
+     * "balance shown is the historical balance at that row".
+     */
+    if (tranTypeFilterActive) {
+      const dataRows = await zcql.executeZCQLQuery(
+        `SELECT ROWID, Account_Code, Transaction_Date, Settlement_Date, ISIN, Security_Name,
+                Transaction_Type, Quantity, Price, Total_Amount, Cash_Balance, STT, Sequence
+         FROM Cash_Balance_Per_Transaction
+         WHERE ${conditions}
+         ORDER BY Sequence DESC
+         LIMIT ${(pgClamped - 1) * size}, ${size}`
+      );
+
+      const data = dataRows.map((r) => {
+        const row = r.Cash_Balance_Per_Transaction || r;
+        const tranType = row.Transaction_Type || "";
+        const amount = Math.abs(Number(row.Total_Amount) || 0);
+        let debit = null;
+        let credit = null;
+        if (CASH_SUBTRACT.includes(tranType)) debit = amount;
+        else if (CASH_ADD.includes(tranType)) credit = amount;
+        return {
+          ROWID: row.ROWID,
+          Account_Code: row.Account_Code,
+          Transaction_Date: (row.Transaction_Date || "").toString().slice(0, 10),
+          Settlement_Date: (row.Settlement_Date || "").toString().slice(0, 10),
+          ISIN: row.ISIN,
+          Security_Name: row.Security_Name,
+          Transaction_Type: tranType,
+          Quantity: row.Quantity,
+          Price: row.Price,
+          Total_Amount: row.Total_Amount,
+          Cash_Balance: Number(row.Cash_Balance) || 0,
+          STT: row.STT,
+          Sequence: row.Sequence,
+          Debit: debit,
+          Credit: credit,
+        };
+      });
+
+      return res.json({
+        data,
+        totalCount,
+        page: pgClamped,
+        pageSize: size,
+        totalPages,
+        tranTypeFiltered: true,
+      });
+    }
+
     /* ── Carry: balance after all rows with index < lowIdx (chronologically before this slice) ── */
     let carryBalP = 0;
 
@@ -129,7 +215,7 @@ export const getCashPassbook = async (req, res) => {
         const priorRows = await zcql.executeZCQLQuery(
           `SELECT Transaction_Type, Total_Amount, STT
            FROM Cash_Balance_Per_Transaction
-           WHERE ${conditions}
+           WHERE ${baseConditions}
            ORDER BY Sequence ASC
            LIMIT ${carryOffset}, ${batchSize}`
         );
@@ -161,7 +247,7 @@ export const getCashPassbook = async (req, res) => {
       `SELECT ROWID, Account_Code, Transaction_Date, Settlement_Date, ISIN, Security_Name,
               Transaction_Type, Quantity, Price, Total_Amount, Cash_Balance, STT, Sequence
        FROM Cash_Balance_Per_Transaction
-       WHERE ${conditions}
+       WHERE ${baseConditions}
        ORDER BY Sequence ASC
        LIMIT ${lowIdx}, ${pageRowCount}`
     );
@@ -224,6 +310,7 @@ export const getCashPassbook = async (req, res) => {
       page: pgClamped,
       pageSize: size,
       totalPages,
+      tranTypeFiltered: false,
     });
   } catch (error) {
     console.error("Cash passbook fetch error:", error);
