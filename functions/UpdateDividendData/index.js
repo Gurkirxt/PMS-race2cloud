@@ -31,7 +31,7 @@ const esc = (s) => String(s ?? "").replace(/'/g, "''");
 
 const normalizeDate = (d) => {
   const dt = new Date(d);
-  dt.setHours(0, 0, 0, 0);
+  dt.setUTCHours(0, 0, 0, 0);
   return dt.toISOString().split("T")[0];
 };
 
@@ -500,9 +500,42 @@ module.exports = async (jobRequest, context) => {
       recordDate,
       paymentDate,
       dividendType,
+      accountCodesJson,
+      applyMode,
     } = params;
     const rate = Number(params.rate);
     jobName = params.jobName;
+
+    /*
+     * Optional account filter passed by the controller. When present the job
+     * still discovers all FIFO-eligible accounts but only writes rows for
+     * those in this allow-list. Used by the Apply Matched Only / Apply All
+     * Reconciled buttons on the Dividend page.
+     */
+    let accountFilter = null;
+    if (accountCodesJson) {
+      try {
+        const arr = JSON.parse(accountCodesJson);
+        if (Array.isArray(arr) && arr.length) {
+          accountFilter = new Set(arr.map((s) => String(s).trim()));
+        }
+      } catch (parseErr) {
+        console.warn(
+          "UpdateDividendData: could not parse accountCodesJson; treating as no filter:",
+          parseErr.message,
+        );
+      }
+    }
+    if (accountFilter) {
+      console.log(
+        `UpdateDividendData: applyMode=${applyMode || "matched"}, ` +
+          `account filter contains ${accountFilter.size} accounts`,
+      );
+    } else {
+      console.log(
+        `UpdateDividendData: applyMode=${applyMode || "system"} (no account filter)`,
+      );
+    }
 
     if (!Number.isFinite(rate) || rate <= 0) {
       console.error("UpdateDividendData: invalid dividend rate ->", params.rate);
@@ -726,12 +759,20 @@ module.exports = async (jobRequest, context) => {
     let insertedCount = 0;
     let skippedNoTxn = 0;
     let skippedFlat = 0;
+    let skippedFiltered = 0;
     let insertErrors = 0;
     let cashInsertedCount = 0;
     let cashSkippedDup = 0;
     let cashErrors = 0;
 
     for (const accountCode of eligibleAccounts) {
+      // Apply Matched Only / Apply All Reconciled: skip accounts that are
+      // not in the allow-list passed by the controller.
+      if (accountFilter && !accountFilter.has(accountCode)) {
+        skippedFiltered++;
+        continue;
+      }
+
       const transactions = txByAccount[accountCode] || [];
       if (!transactions.length) {
         skippedNoTxn++;
@@ -780,44 +821,131 @@ module.exports = async (jobRequest, context) => {
           if (existingCash && existingCash.length > 0) {
             cashSkippedDup++;
           } else {
-            const lastRow = await zcql.executeZCQLQuery(`
+            /*
+             * Insert the dividend row at its CHRONOLOGICAL position, not at
+             * the end of the table. We:
+             *   1. Find the latest existing row whose Transaction_Date is on
+             *      or before this dividend's RecordDate; that row's Sequence
+             *      is `priorSequence` and its Cash_Balance is `priorBalance`.
+             *   2. Bump every later row's Sequence by 1 and add the dividend
+             *      amount to its stored Cash_Balance, processed in DESCENDING
+             *      Sequence order so we never collide on a uniqueness
+             *      assumption.
+             *   3. INSERT the dividend at Sequence = priorSequence + 1 with
+             *      Cash_Balance = priorBalance + dividendAmount.
+             *
+             * Updating the stored Cash_Balance for shifted rows keeps the
+             * chip-filtered Cash Passbook view (which displays the per-row
+             * stored balance, not a recomputed running total) consistent.
+             *
+             * The "All" view of the passbook recomputes the running balance
+             * via a Sequence-ordered carry walk in cashPassbookController.js,
+             * so as long as Sequence is genuinely chronological the dividend
+             * will appear inline between the trades of its RecordDate and
+             * every later balance will be correct.
+             */
+            const priorRow = await zcql.executeZCQLQuery(`
               SELECT Cash_Balance, Sequence FROM Cash_Balance_Per_Transaction
               WHERE Account_Code = '${esc(accountCode)}'
+                AND Transaction_Date <= '${recordDateISO}'
               ORDER BY Sequence DESC
               LIMIT 1
             `);
 
-            let lastBalance = 0;
-            let lastSequence = 0;
-            if (lastRow && lastRow.length > 0) {
-              const r = lastRow[0].Cash_Balance_Per_Transaction || lastRow[0];
-              lastBalance = Number(r.Cash_Balance) || 0;
-              lastSequence = Number(r.Sequence) || 0;
+            let priorBalance = 0;
+            let priorSequence = 0;
+            if (priorRow && priorRow.length > 0) {
+              const r = priorRow[0].Cash_Balance_Per_Transaction || priorRow[0];
+              priorBalance = Number(r.Cash_Balance) || 0;
+              priorSequence = Number(r.Sequence) || 0;
             }
 
+            const newSequence = priorSequence + 1;
             const newBalance =
-              Math.round((lastBalance + dividendAmount) * 100) / 100;
-            const newSequence = lastSequence + 1;
+              Math.round((priorBalance + dividendAmount) * 100) / 100;
 
-            await zcql.executeZCQLQuery(`
-              INSERT INTO Cash_Balance_Per_Transaction
-              (Account_Code, Transaction_Type, Transaction_Date, Settlement_Date, Price, Cash_Balance, Security_Name, ISIN, Quantity, Total_Amount, STT, Sequence)
-              VALUES (
-                '${esc(accountCode)}',
-                'DIVIDEND',
-                '${recordDateISO}',
-                '${recordDateISO}',
-                ${rate},
-                ${newBalance},
-                '${esc(securityCode)}',
-                '${esc(isin)}',
-                ${Math.round(Number(holding) || 0)},
-                ${dividendAmount},
-                0,
-                ${newSequence}
-              )
-            `);
-            cashInsertedCount++;
+            const SHIFT_BATCH = ZCQL_ROW_LIMIT;
+            const rowsToShift = [];
+            let collectOffset = 0;
+            while (true) {
+              const batch = await zcql.executeZCQLQuery(`
+                SELECT ROWID, Sequence, Cash_Balance
+                FROM Cash_Balance_Per_Transaction
+                WHERE Account_Code = '${esc(accountCode)}'
+                  AND Sequence > ${priorSequence}
+                ORDER BY Sequence ASC
+                LIMIT ${SHIFT_BATCH} OFFSET ${collectOffset}
+              `);
+              if (!batch || batch.length === 0) break;
+              for (const r of batch) {
+                const row = r.Cash_Balance_Per_Transaction || r;
+                rowsToShift.push({
+                  ROWID: row.ROWID,
+                  Sequence: Number(row.Sequence),
+                  Cash_Balance: Number(row.Cash_Balance) || 0,
+                });
+              }
+              if (batch.length < SHIFT_BATCH) break;
+              collectOffset += SHIFT_BATCH;
+            }
+
+            // Descending order so Sequence N becomes N+1 only after Sequence N+1
+            // has already become N+2 — avoids any transient duplicate.
+            rowsToShift.sort((a, b) => b.Sequence - a.Sequence);
+
+            // Track successfully shifted rows so we can roll back on failure.
+            const shiftedSoFar = [];
+            try {
+              for (const row of rowsToShift) {
+                const newSeq = row.Sequence + 1;
+                const newBal =
+                  Math.round((row.Cash_Balance + dividendAmount) * 100) / 100;
+                await zcql.executeZCQLQuery(`
+                  UPDATE Cash_Balance_Per_Transaction
+                  SET Sequence = ${newSeq}, Cash_Balance = ${newBal}
+                  WHERE ROWID = '${row.ROWID}'
+                `);
+                shiftedSoFar.push(row);
+              }
+
+              await zcql.executeZCQLQuery(`
+                INSERT INTO Cash_Balance_Per_Transaction
+                (Account_Code, Transaction_Type, Transaction_Date, Settlement_Date, Price, Cash_Balance, Security_Name, ISIN, Quantity, Total_Amount, STT, Sequence)
+                VALUES (
+                  '${esc(accountCode)}',
+                  'DIVIDEND',
+                  '${recordDateISO}',
+                  '${recordDateISO}',
+                  ${rate},
+                  ${newBalance},
+                  '${esc(securityCode)}',
+                  '${esc(isin)}',
+                  ${Math.round(Number(holding) || 0)},
+                  ${dividendAmount},
+                  0,
+                  ${newSequence}
+                )
+              `);
+              cashInsertedCount++;
+            } catch (insertErr) {
+              // Compensate: undo the shifts in ASCENDING new-sequence order so
+              // restoring N+1 → N happens before restoring N+2 → N+1.
+              shiftedSoFar.sort((a, b) => a.Sequence - b.Sequence);
+              for (const row of shiftedSoFar) {
+                try {
+                  await zcql.executeZCQLQuery(`
+                    UPDATE Cash_Balance_Per_Transaction
+                    SET Sequence = ${row.Sequence}, Cash_Balance = ${row.Cash_Balance}
+                    WHERE ROWID = '${row.ROWID}'
+                  `);
+                } catch (rollbackErr) {
+                  console.error(
+                    `Rollback failed for ROWID=${row.ROWID} (account ${accountCode}): ${rollbackErr.message}`,
+                  );
+                }
+              }
+              throw insertErr;
+            }
           }
         } catch (cashErr) {
           cashErrors++;
@@ -835,7 +963,8 @@ module.exports = async (jobRequest, context) => {
 
     console.log(
       `UpdateDividendData done. Master=1, Records inserted=${insertedCount}, ` +
-        `skipped(noTxn)=${skippedNoTxn}, skipped(flat)=${skippedFlat}, errors=${insertErrors}, ` +
+        `skipped(noTxn)=${skippedNoTxn}, skipped(flat)=${skippedFlat}, ` +
+        `skipped(filtered)=${skippedFiltered}, errors=${insertErrors}, ` +
         `CashRows inserted=${cashInsertedCount}, CashRows skipped(dup)=${cashSkippedDup}, CashRows errors=${cashErrors}`,
     );
 

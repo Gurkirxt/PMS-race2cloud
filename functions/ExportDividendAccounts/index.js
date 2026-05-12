@@ -35,20 +35,20 @@ module.exports = async (jobRequest, context) => {
     }
 
     const recordDateObj = new Date(recordDate);
-    recordDateObj.setHours(0, 0, 0, 0);
+    recordDateObj.setUTCHours(0, 0, 0, 0);
     const recordDateISO = recordDateObj.toISOString().split("T")[0];
 
     const exDateForDisplay =
       exDate && String(exDate).trim()
         ? (() => {
             const d = new Date(exDate);
-            d.setHours(0, 0, 0, 0);
+            d.setUTCHours(0, 0, 0, 0);
             return d.toISOString().split("T")[0];
           })()
         : recordDateISO;
 
     const paymentDateObj = new Date(paymentDate);
-    paymentDateObj.setHours(0, 0, 0, 0);
+    paymentDateObj.setUTCHours(0, 0, 0, 0);
     const paymentDateISO = paymentDateObj.toISOString().split("T")[0];
 
     const stratus = catalystApp.stratus();

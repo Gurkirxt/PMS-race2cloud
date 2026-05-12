@@ -76,3 +76,110 @@
     width: 100%;
   }
 }
+
+/* ─────────────── Upload history (last 5) ─────────────── */
+
+.upload-history-card {
+  margin-top: 24px;
+}
+
+.upload-history-error {
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  background-color: #fee2e2;
+  color: #b91c1c;
+  border-radius: 8px;
+  font-size: 14px;
+}
+
+.upload-history-table-wrapper {
+  border: 1px solid #e8ecef;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #fff;
+}
+
+.upload-history-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 14px;
+}
+
+.upload-history-table thead th {
+  background: #f7f9fa;
+  color: #374151;
+  font-weight: 600;
+  padding: 12px 16px;
+  text-align: left;
+  border-bottom: 1px solid #e5e7eb;
+  letter-spacing: 0.02em;
+}
+
+.upload-history-table thead th.num {
+  text-align: right;
+}
+
+.upload-history-table thead th.action {
+  text-align: right;
+  width: 140px;
+}
+
+.upload-history-table tbody tr:nth-child(odd) {
+  background: #f9fbf7;
+}
+
+.upload-history-table tbody tr:nth-child(even) {
+  background: #ffffff;
+}
+
+.upload-history-table td {
+  padding: 12px 16px;
+  color: #1f2933;
+  border-bottom: 1px solid #f1f3f4;
+  vertical-align: middle;
+}
+
+.upload-history-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.upload-history-table td.action {
+  text-align: right;
+}
+
+.upload-history-table td.filename-cell {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.upload-history-table .empty-cell {
+  text-align: center;
+  padding: 24px;
+  color: #6b7280;
+}
+
+.upload-history-download-btn {
+  background: #fff;
+  color: #a01b4c;
+  border: 1px solid #a01b4c;
+  padding: 6px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.upload-history-download-btn:hover:not(:disabled) {
+  background: #a01b4c;
+  color: #fff;
+}
+
+.upload-history-download-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}

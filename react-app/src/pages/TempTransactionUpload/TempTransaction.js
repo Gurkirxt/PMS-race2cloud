@@ -1,7 +1,28 @@
-import React, { useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import MainLayout from "../../layouts/MainLayout";
 import { BASE_URL } from "../../constant";
 import "./TempTransaction.css";
+
+/** Show only the most recent N uploads — no pagination. */
+const HISTORY_LIMIT = 5;
+
+/** "1.23 MB" / "456 KB" / "78 B" — null/undefined → "—". */
+function formatBytes(bytes) {
+    if (bytes == null || Number.isNaN(Number(bytes))) return "—";
+    const n = Number(bytes);
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+    return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+/** ISO string → "12 May 2026, 4:53 pm" (locale). */
+function formatUploadedAt(iso) {
+    if (!iso) return "—";
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return "—";
+    return d.toLocaleString();
+}
 
 /**
  * @typedef {Object} HeaderMismatch
@@ -36,12 +57,87 @@ const TempTransaction = () => {
     /** @type {[UploadErrorDetail | null, React.Dispatch<React.SetStateAction<UploadErrorDetail | null>>]} */
     const [uploadErrorDetail, setUploadErrorDetail] = useState(null);
 
+    /** @type {[Array<{ key: string; originalFileName: string; uploadedAt: string; uploadedAtMs: number; sizeBytes: number; }>, React.Dispatch<React.SetStateAction<any[]>>]} */
+    const [historyItems, setHistoryItems] = useState([]);
+    const [historyLoading, setHistoryLoading] = useState(false);
+    const [historyError, setHistoryError] = useState("");
+    const [downloadingKey, setDownloadingKey] = useState("");
+
     const handleFileChange = (e) => {
         setFile(e.target.files[0] || null);
         setUploadError("");
         setUploadErrorDetail(null);
         setUploadMessage("");
     };
+
+    const refreshHistory = useCallback(async () => {
+        setHistoryLoading(true);
+        setHistoryError("");
+        try {
+            const res = await fetch(
+                `${BASE_URL}/transaction-uploader/upload-history?limit=${HISTORY_LIMIT}`
+            );
+            const text = await res.text();
+            let data = {};
+            try {
+                data = text ? JSON.parse(text) : {};
+            } catch {
+                throw new Error(
+                    "Could not read upload history (server did not return JSON)."
+                );
+            }
+            if (!res.ok || data?.success === false) {
+                throw new Error(
+                    data?.message || `Failed to load upload history (${res.status}).`
+                );
+            }
+            setHistoryItems(Array.isArray(data.items) ? data.items.slice(0, HISTORY_LIMIT) : []);
+        } catch (err) {
+            const isNetwork =
+                err instanceof TypeError ||
+                String(err?.message || "").toLowerCase().includes("failed to fetch");
+            setHistoryError(
+                isNetwork
+                    ? "Could not reach the upload server."
+                    : err.message || "Failed to load upload history"
+            );
+            setHistoryItems([]);
+        } finally {
+            setHistoryLoading(false);
+        }
+    }, []);
+
+    useEffect(() => {
+        refreshHistory();
+    }, [refreshHistory]);
+
+    const handleHistoryDownload = useCallback(async (item) => {
+        if (!item?.key) return;
+        setDownloadingKey(item.key);
+        try {
+            const res = await fetch(
+                `${BASE_URL}/transaction-uploader/upload-history/download?key=${encodeURIComponent(item.key)}`
+            );
+            const text = await res.text();
+            let data = {};
+            try {
+                data = text ? JSON.parse(text) : {};
+            } catch {
+                throw new Error("Could not read download response.");
+            }
+            if (!res.ok || data?.success === false || !data?.downloadUrl) {
+                throw new Error(
+                    data?.message || `Could not get download link (${res.status}).`
+                );
+            }
+            // Open the presigned URL in a new tab so the user keeps the page state.
+            window.open(data.downloadUrl, "_blank", "noopener,noreferrer");
+        } catch (err) {
+            setHistoryError(err.message || "Failed to download file");
+        } finally {
+            setDownloadingKey("");
+        }
+    }, []);
 
     const handleUpload = async () => {
         setUploadError("");
@@ -103,6 +199,7 @@ const TempTransaction = () => {
             }
 
             setUploadMessage("File uploaded successfully.");
+            refreshHistory();
         } catch (err) {
             const isNetwork =
                 err instanceof TypeError ||
@@ -347,6 +444,64 @@ const TempTransaction = () => {
                             ) : null}
                         </div>
                     )}
+                </div>
+
+                <div className="temp-transaction-card upload-history-card">
+                    <h3>Recent Uploads</h3>
+
+                    {historyError && (
+                        <p className="upload-history-error" role="alert">
+                            {historyError}
+                        </p>
+                    )}
+
+                    <div className="upload-history-table-wrapper">
+                        <table className="upload-history-table">
+                            <thead>
+                                <tr>
+                                    <th>Uploaded date</th>
+                                    <th>File name</th>
+                                    <th className="num">Size</th>
+                                    <th className="action">Download</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {historyLoading && historyItems.length === 0 ? (
+                                    <tr>
+                                        <td colSpan={4} className="empty-cell">
+                                            Loading…
+                                        </td>
+                                    </tr>
+                                ) : historyItems.length === 0 ? (
+                                    <tr>
+                                        <td colSpan={4} className="empty-cell">
+                                            {historyError ? "—" : "No uploads yet."}
+                                        </td>
+                                    </tr>
+                                ) : (
+                                    historyItems.map((item) => (
+                                        <tr key={item.key}>
+                                            <td>{formatUploadedAt(item.uploadedAt)}</td>
+                                            <td className="filename-cell" title={item.originalFileName}>
+                                                {item.originalFileName}
+                                            </td>
+                                            <td className="num">{formatBytes(item.sizeBytes)}</td>
+                                            <td className="action">
+                                                <button
+                                                    type="button"
+                                                    className="upload-history-download-btn"
+                                                    onClick={() => handleHistoryDownload(item)}
+                                                    disabled={downloadingKey === item.key}
+                                                >
+                                                    {downloadingKey === item.key ? "Preparing…" : "Download"}
+                                                </button>
+                                            </td>
+                                        </tr>
+                                    ))
+                                )}
+                            </tbody>
+                        </table>
+                    </div>
                 </div>
             </div>
         </MainLayout>
