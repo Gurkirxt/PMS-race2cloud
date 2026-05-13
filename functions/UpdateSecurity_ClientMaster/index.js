@@ -232,13 +232,19 @@ function createCsvParser() {
 
 /**
  * Stream CSV via csv-parser (handles quoted commas/newlines). Accumulate unique
- * accountCodes + ISINs as Sets, then flush with ensure*.
+ * accountCodes + ISINs as Sets, then flush with ensure* and enrich Transaction
+ * rows from Security_List when master has both code and name.
  *
  * Transaction CSV → masters mapping (strict):
  *   - clientIds.WS_Account_code ← BROKERACID | WS_Account_code (same value; bulk rewrite renames header)
  *   - Security_List.ISIN        ← SYMBOLCODE | ISIN
  *
- * No Security_Code / Security_Name / WS_client_id is ever inserted from this flow.
+ * No Security_Code / Security_Name / WS_client_id is ever inserted into Security_List
+ * from this flow. Existing Security_List rows (matched by ISIN) are not modified here.
+ *
+ * After masters sync: for each ISIN seen in the file, if Security_List has **both**
+ * Security_Code and Security_Name filled, UPDATE Transaction rows for that ISIN whose
+ * Security_code and/or Security_Name are empty — otherwise leave Transaction unchanged.
  */
 async function processCsvObjectForMasters(bucket, objectKey, zcql) {
   const accountCodes = new Set();
@@ -299,6 +305,85 @@ async function processCsvObjectForMasters(bucket, objectKey, zcql) {
   }
   for (const isin of isins) {
     await ensureSecurityList(zcql, isin);
+  }
+
+  await enrichTransactionRowsFromSecurityList(zcql, isins);
+}
+
+function hasFilledSecurityMaster(securityCode, securityName) {
+  const c =
+    securityCode != null ? String(securityCode).trim() : "";
+  const n =
+    securityName != null ? String(securityName).trim() : "";
+  return c.length > 0 && n.length > 0;
+}
+
+async function fetchSecurityListRow(zcql, isin) {
+  const rows = await zcql.executeZCQLQuery(`
+    SELECT Security_Code, Security_Name FROM Security_List
+    WHERE ISIN = '${esc(isin)}'
+    LIMIT 1
+  `);
+  if (!rows?.length) return null;
+  const r = rows[0].Security_List || rows[0];
+  return {
+    securityCode: r.Security_Code ?? r.security_code,
+    securityName: r.Security_Name ?? r.security_name,
+  };
+}
+
+/**
+ * Updates Transaction.Security_code / Security_Name from Security_List only when the
+ * master row has BOTH code and name. Skips entirely when either is blank or row missing.
+ * Only touches Transaction rows missing code and/or name (does not overwrite non-empty fields).
+ */
+async function enrichTransactionRowsFromSecurityList(zcql, isins) {
+  for (const rawIsin of isins) {
+    const isin = String(rawIsin ?? "").trim();
+    if (!isValid(isin)) continue;
+
+    let master;
+    try {
+      master = await fetchSecurityListRow(zcql, isin);
+    } catch (e) {
+      console.warn(
+        `[UpdateSecurity_ClientMaster] Security_List read failed for ${isin}:`,
+        e.message,
+      );
+      continue;
+    }
+    if (
+      !master ||
+      !hasFilledSecurityMaster(master.securityCode, master.securityName)
+    ) {
+      continue;
+    }
+
+    const codeEsc = esc(String(master.securityCode).trim());
+    const nameEsc = esc(String(master.securityName).trim());
+
+    try {
+      await zcql.executeZCQLQuery(`
+        UPDATE Transaction
+        SET
+          Security_code = '${codeEsc}',
+          Security_Name = '${nameEsc}'
+        WHERE ISIN = '${esc(isin)}'
+        AND (
+          Security_code IS NULL OR Security_code = ''
+          OR Security_Name IS NULL OR Security_Name = ''
+        )
+      `);
+      console.log(
+        "[UpdateSecurity_ClientMaster] Transaction enriched from Security_List for ISIN:",
+        isin,
+      );
+    } catch (e) {
+      console.warn(
+        `[UpdateSecurity_ClientMaster] Transaction enrich failed for ISIN ${isin}:`,
+        e.message,
+      );
+    }
   }
 }
 
