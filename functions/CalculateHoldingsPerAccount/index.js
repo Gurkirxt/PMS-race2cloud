@@ -1,5 +1,7 @@
 /**
- * CalculateHoldingPerAccount (Catalyst Function)
+ * CalculateHoldingsPerAccount (Catalyst Job Function)
+ *
+ * This is the job deployment (type job) mirroring the former event function logic.
  *
  * Reads Transaction (+ Bonus, Split, Demerger_Record, Merger), runs the same FIFO
  * engine as AppSail analytics (`util/analytics/transactionHistory/fifo.js`), and
@@ -75,7 +77,7 @@ function extractJobParams(jobRequest) {
 }
 
 /**
- * Parses `pairsJson` job param: JSON array of [WS_Account_code, ISIN] or { wsAccountCode, isin }.
+ * Parses `pairsJson` job param from upload-temp-file: JSON array of [WS_Account_code, ISIN] or { wsAccountCode, isin }.
  * @returns {Array<[string, string]>}
  */
 function parseScopedPairsFromJob(jobRequest) {
@@ -1139,7 +1141,7 @@ module.exports = async (jobRequest, context) => {
 
     if (fromTxnUpload && scopedPairs.length === 0) {
       console.warn(
-        `CalculateHoldingPerAccount: source=${HOLDINGS_UPLOAD_SOURCE} but no pairs in pairsJson — exiting without full rebuild.`,
+        `CalculateHoldingsPerAccount: source=${HOLDINGS_UPLOAD_SOURCE} but no pairs in pairsJson — exiting without full rebuild.`,
       );
       context.closeWithSuccess();
       return;
@@ -1154,7 +1156,7 @@ module.exports = async (jobRequest, context) => {
       }
 
       console.log(
-        `CalculateHoldingPerAccount scoped: ${scopedPairs.length} distinct pair(s) across ${byAccount.size} account(s) | ` +
+        `CalculateHoldingsPerAccount scoped: ${scopedPairs.length} distinct pair(s) across ${byAccount.size} account(s) | ` +
           `AS_ON_DATE=${AS_ON_DATE ?? "null"} | DRY_RUN=${DRY_RUN} | ` +
           `MAX_PAIRS=${MAX_PAIRS} | jobTracking=${trackingOn ? `"${trackingJobName}"` : "off"}`,
       );
@@ -1223,7 +1225,7 @@ module.exports = async (jobRequest, context) => {
       }
 
       console.log(
-        `CalculateHoldingPerAccount scoped done in ${Date.now() - startedAt}ms: ` +
+        `CalculateHoldingsPerAccount scoped done in ${Date.now() - startedAt}ms: ` +
           `${counters.pairs} pair(s), ${counters.rows} row(s), ${counters.errors} error(s).`,
       );
 
@@ -1241,7 +1243,7 @@ module.exports = async (jobRequest, context) => {
 
     if (fromTxnUpload) {
       console.warn(
-        `CalculateHoldingPerAccount: source=${HOLDINGS_UPLOAD_SOURCE} requires pairsJson — exiting without full rebuild.`,
+        `CalculateHoldingsPerAccount: source=${HOLDINGS_UPLOAD_SOURCE} requires pairsJson — exiting without full rebuild.`,
       );
       context.closeWithSuccess();
       return;
@@ -1250,7 +1252,7 @@ module.exports = async (jobRequest, context) => {
     const accounts = await fetchDistinctAccounts(zcql);
 
     console.log(
-      `CalculateHoldingPerAccount: ${accounts.length} account(s) | ` +
+      `CalculateHoldingsPerAccount: ${accounts.length} account(s) | ` +
       `AS_ON_DATE=${AS_ON_DATE ?? "null"} | DRY_RUN=${DRY_RUN} | ` +
       `ACCOUNTS_FILTER=[${ACCOUNTS_FILTER.join(",")}] | ` +
       `ISINS_FILTER=[${ISINS_FILTER.join(",")}] | MAX_PAIRS=${MAX_PAIRS} | ` +
@@ -1320,7 +1322,7 @@ module.exports = async (jobRequest, context) => {
     }
 
     console.log(
-      `CalculateHoldingPerAccount done in ${Date.now() - startedAt}ms: ` +
+      `CalculateHoldingsPerAccount done in ${Date.now() - startedAt}ms: ` +
       `${counters.pairs} pair(s), ${counters.rows} row(s), ${counters.errors} error(s).`,
     );
 
@@ -1334,7 +1336,7 @@ module.exports = async (jobRequest, context) => {
 
     context.closeWithSuccess();
   } catch (err) {
-    console.error("CalculateHoldingPerAccount failed:", err);
+    console.error("CalculateHoldingsPerAccount failed:", err);
     if (trackingOn) {
       await finalizeJobsRow(zcql, trackingJobName, "FAILED");
     }

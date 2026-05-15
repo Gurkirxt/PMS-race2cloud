@@ -316,6 +316,12 @@ function normalizeCsvForBulkUpload(fileBuffer) {
   return Buffer.from(newLines.join("\n"), "utf8");
 }
 
+/** Max distinct (BROKERACID, SYMBOLCODE) pairs collected from one CSV for scoped Holdings job. */
+const MAX_HOLDINGS_SCOPE_PAIRS = 25000;
+
+/** Soft cap on serialized pairsJson for Catalyst job params (~1MB safety). */
+const MAX_PAIRS_JSON_CHARS = 900000;
+
 /** First N data rows parsed for date-format checks before upload. */
 const SAMPLE_DATA_ROW_COUNT = 3;
 
@@ -366,6 +372,60 @@ function parseTempTransactionSampleRows(fileBuffer) {
 }
 
 /**
+ * Reads every data row; collects unique (BROKERACID, SYMBOLCODE) for scoped Holdings rebuild.
+ */
+function extractDistinctBrokerAccountIsinPairsFromCsv(fileBuffer) {
+  return new Promise((resolve, reject) => {
+    const text = stripBom(fileBuffer.toString("utf8"));
+    const firstLine = getFirstLineText(fileBuffer);
+    const separator = detectSeparator(firstLine);
+    const seen = new Set();
+    const pairs = [];
+    let truncated = false;
+    const source = Readable.from(text);
+    const parser = csv({ separator });
+    let settled = false;
+
+    const settle = (err, result) => {
+      if (settled) return;
+      settled = true;
+      source.removeAllListeners();
+      parser.removeAllListeners();
+      try {
+        source.destroy();
+        parser.destroy();
+      } catch {
+        /* ignore */
+      }
+      if (err) {
+        reject(err);
+        return;
+      }
+      resolve(result);
+    };
+
+    parser.on("data", (row) => {
+      const acc = String(getCell(row, "BROKERACID") ?? "").trim();
+      const isin = String(getCell(row, "SYMBOLCODE") ?? "").trim();
+      if (!acc || !isin) return;
+      const key = `${acc}\t${isin}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      pairs.push([acc, isin]);
+      if (pairs.length >= MAX_HOLDINGS_SCOPE_PAIRS) {
+        truncated = true;
+      }
+    });
+
+    parser.on("end", () => settle(null, { pairs, truncated }));
+    parser.on("error", (e) => settle(e));
+    source.on("error", (e) => settle(e));
+
+    source.pipe(parser);
+  });
+}
+
+/**
  * POST /api/transaction-uploader/upload-temp-file
  * 1. Validates row 1 matches EXPECTED_HEADERS_IN_ORDER (26 columns, count + order + exact names).
  * 2. Validates the CSV parses and has at least one data row.
@@ -374,6 +434,7 @@ function parseTempTransactionSampleRows(fileBuffer) {
  * 5. Uploads rewritten CSV to Stratus bucket client-transaction-files under transactions/.
  * 6. Inserts `Jobs` (RUNNING), runs Datastore bulk write → `Transaction`, polls to completion,
  *    then sets `Jobs` to COMPLETED (or FAILED). `jobName` is `TxnCsv_<ms>` matching `TxnUpload-<ms>-` in objectKey.
+ * 7. Queues `CalculateHoldingsPerAccount` on UpdateMasters with `source: TxnUpload` and `pairsJson` (file pairs only; skips queue if none).
  */
 export const uploadTempTransaction = async (req, res) => {
   let pipelineJobName = null;
@@ -469,6 +530,24 @@ export const uploadTempTransaction = async (req, res) => {
       }
     }
 
+    /* ─── 1c. DISTINCT (BROKERACID, SYMBOLCODE) FOR SCOPED HOLDINGS JOB ─ */
+    let scopePairsResult = { pairs: [], truncated: false };
+    try {
+      scopePairsResult = await extractDistinctBrokerAccountIsinPairsFromCsv(
+        file.data,
+      );
+    } catch (pairErr) {
+      console.error(
+        `[TempTransactionUpload] pair-list CSV parse [${new Date().toISOString()}]:`,
+        pairErr,
+      );
+      return res.status(400).json({
+        success: false,
+        message:
+          "Could not scan the CSV for broker account / ISIN pairs. Check the file and try again.",
+      });
+    }
+
     /* ─── 2. NORMALIZE CSV & UPLOAD TO STRATUS ───────────────────── */
     const rewrittenCsv = normalizeCsvForBulkUpload(file.data);
 
@@ -519,12 +598,73 @@ export const uploadTempTransaction = async (req, res) => {
 
     await updateJobsStatus(zcqlForJob, pipelineJobName, "COMPLETED");
 
+    /* Serialize distinct pairs for scoped Holdings job (Catalyst param size cap). */
+    let pairsForJob = scopePairsResult.pairs;
+    let holdingsPairsJsonTruncated = false;
+    let pairsJson = JSON.stringify(pairsForJob);
+    if (pairsJson.length > MAX_PAIRS_JSON_CHARS) {
+      holdingsPairsJsonTruncated = true;
+      while (
+        pairsForJob.length > 1 &&
+        JSON.stringify(pairsForJob).length > MAX_PAIRS_JSON_CHARS
+      ) {
+        pairsForJob = pairsForJob.slice(
+          0,
+          Math.max(1, Math.floor(pairsForJob.length * 0.85)),
+        );
+      }
+      pairsJson = JSON.stringify(pairsForJob);
+      console.warn(
+        `[TempTransactionUpload] pairsJson trimmed to ${pairsForJob.length} pair(s) (param size cap ${MAX_PAIRS_JSON_CHARS})`,
+      );
+    }
+
+    /* Holdings rebuild: queue on UpdateMasters only when CSV has account/ISIN pairs. */
+    let holdingsQueueJobName = null;
+    let holdingsJobSkipped = false;
+    if (pairsForJob.length === 0) {
+      holdingsJobSkipped = true;
+      console.warn(
+        "[TempTransactionUpload] No BROKERACID/SYMBOLCODE pairs in CSV — skipping CalculateHoldingsPerAccount queue.",
+      );
+    } else {
+      try {
+        const jobScheduling = catalystApp.jobScheduling();
+        holdingsQueueJobName = `CHPA_${Date.now()}`.slice(0, 20);
+        await jobScheduling.JOB.submitJob({
+          job_name: holdingsQueueJobName,
+          jobpool_name: "UpdateMasters",
+          target_name: "CalculateHoldingsPerAccount",
+          target_type: "Function",
+          job_config: {
+            number_of_retries: 5,
+            retry_interval: 60 * 1000,
+          },
+          params: {
+            source: "TxnUpload",
+            pairsJson,
+          },
+        });
+      } catch (holdingsErr) {
+        console.error(
+          "[TempTransactionUpload] Failed to queue CalculateHoldingsPerAccount:",
+          holdingsErr,
+        );
+      }
+    }
+
     /* ─── 4. RESPOND ──────────────────────────────────────────────── */
     return res.status(200).json({
       success: true,
-      message:
-        "Transaction bulk import finished. Jobs row is COMPLETED — bind a Signals rule on Jobs (status COMPLETED, jobName TxnCsv_*) to run downstream work.",
+      message: holdingsJobSkipped
+        ? "Transaction bulk import finished and Jobs is COMPLETED. Holdings job was not queued (no account/ISIN pairs found in the CSV)."
+        : "Transaction bulk import finished and Jobs is COMPLETED. CalculateHoldingsPerAccount was queued for account/ISIN pairs from this file only.",
       pipelineJobName,
+      holdingsQueueJobName,
+      holdingsJobSkipped,
+      holdingsDistinctPairs: pairsForJob.length,
+      holdingsPairsTruncated: scopePairsResult.truncated,
+      holdingsPairsJsonTruncated,
       fileName: file.name,
       objectKey,
       bucket: BUCKET_NAME,
