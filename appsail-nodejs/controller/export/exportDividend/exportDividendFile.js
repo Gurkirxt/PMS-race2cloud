@@ -1,6 +1,13 @@
-import { runFifoEngine } from "../../../util/analytics/transactionHistory/fifo.js";
-
 const BATCH_SIZE = 270;
+
+/**
+ * jobName format: DIV_<ISIN>_<ms>; Stratus object: DividendExport_<ISIN>_<ms>.csv
+ * (same millisecond suffix — required for export-status → export-download flow).
+ */
+function dividendExportFileNameFromJobName(jobName) {
+  if (typeof jobName !== "string" || !jobName.startsWith("DIV_")) return "";
+  return `DividendExport_${jobName.slice(4)}.csv`;
+}
 
 const parseCatalystTime = (ct) => {
   if (!ct) return 0;
@@ -33,8 +40,9 @@ export const exportDividendPreviewFile = async (req, res) => {
     const zcql = catalystApp.zcql();
     const jobScheduling = catalystApp.jobScheduling();
 
-    const jobName = `DIV_${isin}_${Date.now()}`;
-    const fileName = `DividendExport_${isin}_${Date.now()}.csv`;
+    const ts = Date.now();
+    const jobName = `DIV_${isin}_${ts}`;
+    const fileName = `DividendExport_${isin}_${ts}.csv`;
 
     const existing = await zcql.executeZCQLQuery(
       `SELECT ROWID, status, CREATEDTIME FROM Jobs WHERE jobName LIKE 'DIV_${isin}_*' ORDER BY ROWID DESC LIMIT 1`
@@ -50,9 +58,11 @@ export const exportDividendPreviewFile = async (req, res) => {
       const isStale = jobAge > STALE_TIMEOUT_MS;
 
       if ((oldStatus === "PENDING" || oldStatus === "RUNNING") && !isStale) {
+        const activeJobName = existing[0].Jobs.jobName || jobName;
         return res.json({
           success: true,
-          jobName: existing[0].Jobs.jobName || jobName,
+          jobName: activeJobName,
+          fileName: dividendExportFileNameFromJobName(activeJobName),
           status: oldStatus,
           message: "Dividend export is already in progress for this ISIN",
         });
@@ -146,10 +156,19 @@ export const downloadDividendExportFile = async (req, res) => {
   try {
     const catalystApp = req.catalystApp;
     const zcql = catalystApp.zcql();
-    const { jobName, fileName } = req.query;
+    let { jobName, fileName } = req.query;
 
-    if (!jobName || !fileName) {
-      return res.status(400).json({ success: false, message: "jobName and fileName are required" });
+    if (!jobName) {
+      return res.status(400).json({ success: false, message: "jobName is required" });
+    }
+    if (!fileName) {
+      fileName = dividendExportFileNameFromJobName(jobName);
+    }
+    if (!fileName) {
+      return res.status(400).json({
+        success: false,
+        message: "fileName is required (or use a DIV_<ISIN>_<ts> jobName)",
+      });
     }
 
     const job = await zcql.executeZCQLQuery(

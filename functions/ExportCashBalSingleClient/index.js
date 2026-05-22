@@ -3,9 +3,6 @@ const catalyst = require("zcatalyst-sdk-node");
 
 const BATCH = 300;
 
-const CASH_ADD = ["CS+", "SL+", "CSI", "IN1", "IN+", "DIO", "DI0", "DI1", "OI1", "DIS", "SQS", "DIVIDEND"];
-const CASH_SUBTRACT = ["BY-", "CS-", "MGF", "E22", "E01", "CUS", "E23", "MGE", "E10", "PRF", "NF-", "SQB", "TDO", "TDI"];
-
 const esc = (s) => String(s ?? "").replace(/'/g, "''");
 const csvCell = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
 
@@ -57,14 +54,8 @@ module.exports = async (jobRequest, context) => {
       "Tran Date,Set Date,Account Code,ISIN,Security Name,Tran Type,QTY,Rate,STT,Amount,Cash Balance\n"
     );
 
-    /* Paise helpers for precision */
-    const toPaise = (n) => Math.round(n * 100);
-    const fromPaise = (p) => Number((p / 100).toFixed(2));
-
     let offset = 0;
     let totalRows = 0;
-    let runBalP = 0;        // running balance in paise
-    let isFirstRecord = true;
 
     while (true) {
       const query = baseQuery + ` LIMIT ${BATCH} OFFSET ${offset}`;
@@ -74,28 +65,6 @@ module.exports = async (jobRequest, context) => {
       for (const r of rows) {
         const row = r.Cash_Balance_Per_Transaction || r;
         const tranType = (row.Transaction_Type || "").trim();
-        const totalAmount = Number(row.Total_Amount) || 0;
-        const amtP = toPaise(Math.abs(totalAmount));
-        const sttP = toPaise(Math.abs(Number(row.STT) || 0));
-
-        // Compute running balance in paise
-        if (isFirstRecord && tranType === "CS+") {
-          runBalP = amtP - sttP;
-          isFirstRecord = false;
-        } else if (CASH_ADD.includes(tranType)) {
-          runBalP += amtP - sttP;
-        } else if (CASH_SUBTRACT.includes(tranType)) {
-          runBalP -= (amtP + sttP);
-        }
-
-        let amountStr = "";
-        if (CASH_SUBTRACT.includes(tranType)) {
-          amountStr = `- ${totalAmount}`;
-        } else if (CASH_ADD.includes(tranType)) {
-          amountStr = `+ ${totalAmount}`;
-        } else {
-          amountStr = String(totalAmount);
-        }
 
         const line = [
           csvCell((row.Transaction_Date || "").toString().slice(0, 10)),
@@ -107,8 +76,8 @@ module.exports = async (jobRequest, context) => {
           csvCell(row.Quantity),
           csvCell(row.Price),
           csvCell(row.STT),
-          csvCell(amountStr),
-          csvCell(fromPaise(runBalP)),
+          csvCell(row.Total_Amount),
+          csvCell(row.Cash_Balance),
         ].join(",");
 
         csvLines.push(line + "\n");
