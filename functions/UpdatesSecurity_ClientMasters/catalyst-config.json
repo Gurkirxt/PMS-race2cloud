@@ -1,0 +1,8 @@
+{
+  "execution": { "main": "index.js" },
+  "deployment": {
+    "stack": "node20",
+    "name": "UpdatesSecurity_ClientMasters",
+    "type": "job"
+  }
+}

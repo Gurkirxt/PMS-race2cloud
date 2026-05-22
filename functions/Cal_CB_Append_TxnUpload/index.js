@@ -1,21 +1,17 @@
 /**
- * Cal_CB_Per_TNX: DELETE + full rebuild of Cash_Balance_Per_Transaction per account.
+ * Cal_CB_Append_TxnUpload: Incremental cash passbook append after transaction CSV upload.
  *
- * - Reads cash-affecting rows from Transaction only (no Dividend_Record).
- * - DELETE all passbook rows for the account (repeat DELETE until COUNT=0; Catalyst ~300/round), then rebuild 2020–2026 in 6-month chunks.
- * - Accounts: job param accountCodesJson, pairsJson (account column), or LEGACY_CLIENT_IDS.
+ * - No DELETE. Appends new Transaction rows from this import only (CREATEDTIME >= importStartedAtMs).
+ * - Continues Cash_Balance / Sequence from the last passbook row per account.
+ * - Queued from TempTransactionUpload with source=TxnUpload, accountCodesJson, importStartedAtMs.
+ *
+ * Full rebuild: use Cal_CB_Per_TNX (manual / cron).
  */
 
 const catalyst = require("zcatalyst-sdk-node");
 
 const BATCH_SIZE = 300;
-
-const LEGACY_CLIENT_IDS = [
-  
-  ];
-const GLOBAL_START = "2020-01-01";
-const GLOBAL_END = "2026-12-31";
-const CHUNK_MONTHS = 6;
+const CASH_UPLOAD_SOURCE = "TxnUpload";
 
 const CASH_ADD = [
   "CS+",
@@ -60,6 +56,26 @@ function getJobParams(jobRequest) {
   return {};
 }
 
+function getJobSource(jobRequest) {
+  return String(getJobParams(jobRequest).source ?? "").trim();
+}
+
+function parseImportStartedAtMs(jobRequest) {
+  const p = getJobParams(jobRequest);
+  const raw = p.importStartedAtMs ?? p.import_started_at_ms;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
+function createdTimeFloorFromMs(ms) {
+  const d = new Date(ms - 15_000);
+  const pad = (n) => String(n).padStart(2, "0");
+  return (
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+    `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}:000`
+  );
+}
+
 function parseAccountCodesFromJob(jobRequest) {
   try {
     const p = getJobParams(jobRequest);
@@ -87,30 +103,6 @@ function parseAccountCodesFromJob(jobRequest) {
     return out.sort((a, b) => a.localeCompare(b));
   } catch (e) {
     console.warn("parseAccountCodesFromJob:", e.message);
-    return [];
-  }
-}
-
-function parseAccountCodesFromPairsJson(jobRequest) {
-  try {
-    const p = getJobParams(jobRequest);
-    const raw = p.pairsJson ?? p.pairs_json;
-    if (raw == null || raw === "") return [];
-    const arr = typeof raw === "string" ? JSON.parse(raw) : raw;
-    if (!Array.isArray(arr) || arr.length === 0) return [];
-    const seen = new Set();
-    for (const item of arr) {
-      let acc = "";
-      if (Array.isArray(item) && item.length >= 1) {
-        acc = String(item[0] ?? "").trim();
-      } else if (item && typeof item === "object") {
-        acc = String(item.wsAccountCode ?? item.account ?? "").trim();
-      }
-      if (acc) seen.add(acc);
-    }
-    return [...seen].sort((a, b) => a.localeCompare(b));
-  } catch (e) {
-    console.warn("parseAccountCodesFromPairsJson:", e.message);
     return [];
   }
 }
@@ -181,29 +173,8 @@ async function fetchBatched(zcql, baseQuery, mapper) {
   return rows;
 }
 
-function generateDateChunks(startISO, endISO, months) {
-  const chunks = [];
-  let cursor = new Date(startISO + "T00:00:00Z");
-  const end = new Date(endISO + "T00:00:00Z");
-
-  while (cursor <= end) {
-    const chunkStart = cursor.toISOString().split("T")[0];
-    const next = new Date(cursor);
-    next.setUTCMonth(next.getUTCMonth() + months);
-    next.setUTCDate(next.getUTCDate() - 1);
-    const chunkEnd =
-      next > end ? end.toISOString().split("T")[0] : next.toISOString().split("T")[0];
-
-    chunks.push({ start: chunkStart, end: chunkEnd });
-
-    const nextStart = new Date(next);
-    nextStart.setUTCDate(nextStart.getUTCDate() + 1);
-    cursor = nextStart;
-  }
-  return chunks;
-}
-
-async function fetchChunkEvents(zcql, accountCode, startDate, endDate) {
+async function fetchNewTransactionEventsSinceImport(zcql, accountCode, importStartedAtMs) {
+  const createdFloor = createdTimeFloorFromMs(importStartedAtMs);
   const inflowTypesList = CASH_ADD.map((t) => `'${esc(t)}'`).join(", ");
   const outflowTypesList = CASH_SUBTRACT.map((t) => `'${esc(t)}'`).join(", ");
 
@@ -212,7 +183,7 @@ async function fetchChunkEvents(zcql, accountCode, startDate, endDate) {
     FROM Transaction
     WHERE WS_Account_code = '${esc(accountCode)}'
       AND Tran_Type IN (${inflowTypesList})
-      AND SETDATE >= '${startDate}' AND SETDATE <= '${endDate}'
+      AND CREATEDTIME >= '${createdFloor}'
     ORDER BY SETDATE ASC, executionPriority ASC, ROWID ASC
   `;
 
@@ -221,7 +192,7 @@ async function fetchChunkEvents(zcql, accountCode, startDate, endDate) {
     FROM Transaction
     WHERE WS_Account_code = '${esc(accountCode)}'
       AND Tran_Type IN (${outflowTypesList})
-      AND TRANDATE >= '${startDate}' AND TRANDATE <= '${endDate}'
+      AND CREATEDTIME >= '${createdFloor}'
     ORDER BY TRANDATE ASC, executionPriority ASC, ROWID ASC
   `;
 
@@ -230,7 +201,30 @@ async function fetchChunkEvents(zcql, accountCode, startDate, endDate) {
     fetchBatched(zcql, outflowQuery, mapOutflow),
   ]);
 
-  return { inflowRows, outflowRows };
+  return [...inflowRows, ...outflowRows];
+}
+
+async function getPassbookTail(zcql, accountCode) {
+  const rows = await zcql.executeZCQLQuery(`
+    SELECT Cash_Balance, Sequence
+    FROM Cash_Balance_Per_Transaction
+    WHERE Account_Code = '${esc(accountCode)}'
+    ORDER BY Sequence DESC
+    LIMIT 1
+  `);
+
+  if (!rows || rows.length === 0) {
+    return null;
+  }
+
+  const row = rows[0].Cash_Balance_Per_Transaction || rows[0];
+  const balance = Number(row.Cash_Balance) || 0;
+  const sequence = Number(row.Sequence) || 0;
+  return {
+    balanceP: Math.round(balance * 100),
+    sequence,
+    usedOpeningCsPlus: sequence > 0,
+  };
 }
 
 async function insertPassbookEvents(zcql, accountCode, events, state) {
@@ -287,132 +281,31 @@ async function insertPassbookEvents(zcql, accountCode, events, state) {
   };
 }
 
-const DELETE_LOOP_MAX_ROUNDS = 500;
-
-async function countPassbookRowsForAccount(zcql, accountCode) {
-  const rows = await zcql.executeZCQLQuery(`
-    SELECT COUNT(ROWID) FROM Cash_Balance_Per_Transaction
-    WHERE Account_Code = '${esc(accountCode)}'
-  `);
-  const r = rows?.[0]?.Cash_Balance_Per_Transaction || rows?.[0] || {};
-  return Number(
-    r["COUNT(ROWID)"] ?? r.cnt ?? r["count"] ?? Object.values(r)[0] ?? 0,
+async function incrementalAppendForAccount(zcql, accountCode, importStartedAtMs) {
+  const newEvents = await fetchNewTransactionEventsSinceImport(
+    zcql,
+    accountCode,
+    importStartedAtMs,
   );
-}
 
-/**
- * Catalyst caps ~300 rows per DELETE — repeat plain DELETE until COUNT is 0.
- */
-async function deleteCashPassbookForAccount(zcql, accountCode) {
-  let rounds = 0;
-  let remaining = await countPassbookRowsForAccount(zcql, accountCode);
-  const initial = remaining;
-
-  if (remaining === 0) {
-    console.log(`[${accountCode}] passbook delete: already empty`);
-    return { deletedRounds: 0, initialCount: 0 };
-  }
-
-  while (remaining > 0) {
-    rounds++;
-    if (rounds > DELETE_LOOP_MAX_ROUNDS) {
-      throw new Error(
-        `Passbook delete for ${accountCode} exceeded ${DELETE_LOOP_MAX_ROUNDS} rounds (${remaining} row(s) left)`,
-      );
-    }
-
-    await zcql.executeZCQLQuery(`
-      DELETE FROM Cash_Balance_Per_Transaction
-      WHERE Account_Code = '${esc(accountCode)}'
-    `);
-
-    const after = await countPassbookRowsForAccount(zcql, accountCode);
-    if (after >= remaining) {
-      throw new Error(
-        `Passbook delete stalled for ${accountCode}: ${remaining} row(s) before DELETE, ${after} after`,
-      );
-    }
-    remaining = after;
-  }
-
-  console.log(
-    `[${accountCode}] passbook delete done: cleared ${initial} row(s) in ${rounds} DELETE round(s)`,
-  );
-  return { deletedRounds: rounds, initialCount: initial };
-}
-
-/** DELETE all passbook rows for account, then full rebuild from Transaction (2020–2026 chunks). */
-async function rebuildCashPassbookForAccount(zcql, accountCode) {
-  await deleteCashPassbookForAccount(zcql, accountCode);
-
-  const verifyEmpty = await countPassbookRowsForAccount(zcql, accountCode);
-  if (verifyEmpty > 0) {
-    throw new Error(
-      `Passbook not empty after delete for ${accountCode}: ${verifyEmpty} row(s) remain`,
-    );
-  }
-
-  const chunks = generateDateChunks(GLOBAL_START, GLOBAL_END, CHUNK_MONTHS);
-  let state = { balanceP: 0, sequence: 0, usedOpeningCsPlus: false };
-  let isFirstChunk = true;
-  let totalInserted = 0;
-
-  for (let ci = 0; ci < chunks.length; ci++) {
-    const { start, end } = chunks[ci];
-
-    const { inflowRows, outflowRows } = await fetchChunkEvents(
-      zcql,
-      accountCode,
-      start,
-      end,
-    );
-
-    const allEvents = [...inflowRows, ...outflowRows];
-    if (allEvents.length === 0) {
-      continue;
-    }
-
-    sortCashEvents(allEvents);
-
-    if (isFirstChunk) {
-      const firstImpactDate = allEvents[0].impactDate;
-      const firstDayCsPlus = allEvents.find(
-        (e) => e.impactDate === firstImpactDate && e.type === "CS+",
-      );
-      if (firstDayCsPlus) {
-        state.balanceP = Math.round(Math.abs(firstDayCsPlus.netAmount) * 100);
-        state.usedOpeningCsPlus = false;
-      }
-      isFirstChunk = false;
-    }
-
-    const result = await insertPassbookEvents(zcql, accountCode, allEvents, state);
-    state = {
-      balanceP: result.balanceP,
-      sequence: result.sequence,
-      usedOpeningCsPlus: result.usedOpeningCsPlus,
+  if (newEvents.length === 0) {
+    const tail = await getPassbookTail(zcql, accountCode);
+    return {
+      inserted: 0,
+      finalBalance: tail ? Number((tail.balanceP / 100).toFixed(2)) : 0,
+      skipped: true,
     };
-    totalInserted += result.inserted;
   }
 
-  return {
-    inserted: totalInserted,
-    finalBalance: Number((state.balanceP / 100).toFixed(2)),
-  };
-}
+  sortCashEvents(newEvents);
 
-function resolveAccountList(jobRequest) {
-  let accounts = parseAccountCodesFromJob(jobRequest);
-  if (accounts.length === 0) {
-    accounts = parseAccountCodesFromPairsJson(jobRequest);
+  let state = await getPassbookTail(zcql, accountCode);
+  if (!state) {
+    state = { balanceP: 0, sequence: 0, usedOpeningCsPlus: false };
   }
-  if (accounts.length > 0) {
-    return { accounts, mode: "scoped" };
-  }
-  if (LEGACY_CLIENT_IDS.length > 0) {
-    return { accounts: [...LEGACY_CLIENT_IDS], mode: "legacy" };
-  }
-  return { accounts: [], mode: "empty" };
+
+  const result = await insertPassbookEvents(zcql, accountCode, newEvents, state);
+  return { inserted: result.inserted, finalBalance: result.finalBalance, skipped: false };
 }
 
 module.exports = async (jobRequest, context) => {
@@ -420,18 +313,38 @@ module.exports = async (jobRequest, context) => {
   const zcql = catalystApp.zcql();
 
   const startedAt = Date.now();
-  const { accounts, mode } = resolveAccountList(jobRequest);
-  const counters = { accounts: 0, rows: 0, errors: 0 };
+  const importStartedAtMs = parseImportStartedAtMs(jobRequest);
+  const accounts = parseAccountCodesFromJob(jobRequest);
+  const counters = { accounts: 0, rows: 0, errors: 0, skipped: 0 };
 
   try {
+    if (getJobSource(jobRequest) !== CASH_UPLOAD_SOURCE) {
+      console.error(
+        `Cal_CB_Append_TxnUpload: requires source=${CASH_UPLOAD_SOURCE} — exiting.`,
+      );
+      context.closeWithFailure();
+      return;
+    }
+
+    if (importStartedAtMs <= 0) {
+      console.error(
+        "Cal_CB_Append_TxnUpload: importStartedAtMs job param is required — exiting.",
+      );
+      context.closeWithFailure();
+      return;
+    }
+
     if (accounts.length === 0) {
-      console.warn("Cal_CB_Per_TNX: no accounts to process — exiting.");
+      console.warn(
+        "Cal_CB_Append_TxnUpload: no accounts in accountCodesJson — exiting.",
+      );
       context.closeWithSuccess();
       return;
     }
 
     console.log(
-      `Cal_CB_Per_TNX: ${accounts.length} account(s) | mode=${mode} | run=fullRebuild (Transaction only)`,
+      `Cal_CB_Append_TxnUpload: ${accounts.length} account(s) | run=incremental | ` +
+        `importStartedAtMs=${importStartedAtMs}`,
     );
 
     for (let ai = 0; ai < accounts.length; ai++) {
@@ -440,23 +353,29 @@ module.exports = async (jobRequest, context) => {
       console.log(`\n===== Account ${ai + 1}/${accounts.length}: ${accountCode} =====`);
 
       try {
-        const result = await rebuildCashPassbookForAccount(zcql, accountCode);
+        const result = await incrementalAppendForAccount(
+          zcql,
+          accountCode,
+          importStartedAtMs,
+        );
         counters.rows += result.inserted;
+        if (result.skipped) counters.skipped++;
 
         console.log(
-          `Account ${accountCode} done: ${result.inserted} row(s) inserted (full rebuild), ` +
+          `Account ${accountCode} done: ${result.inserted} row(s) appended` +
+            `${result.skipped ? " (no new cash transactions for this import)" : ""}, ` +
             `final balance=${result.finalBalance}`,
         );
       } catch (err) {
         counters.errors++;
-        console.error(`[${accountCode}] cash passbook failed:`, err.message);
+        console.error(`[${accountCode}] cash passbook append failed:`, err.message);
       }
     }
 
     console.log(
-      `\nCal_CB_Per_TNX completed in ${Date.now() - startedAt}ms: ` +
-        `${counters.accounts} account(s), ${counters.rows} row(s) inserted, ` +
-        `${counters.errors} error(s).`,
+      `\nCal_CB_Append_TxnUpload completed in ${Date.now() - startedAt}ms: ` +
+        `${counters.accounts} account(s), ${counters.rows} row(s) appended, ` +
+        `${counters.skipped} skipped, ${counters.errors} error(s).`,
     );
 
     if (counters.errors > 0) {
@@ -465,7 +384,7 @@ module.exports = async (jobRequest, context) => {
     }
     context.closeWithSuccess();
   } catch (error) {
-    console.error("Cal_CB_Per_TNX failed:", error);
+    console.error("Cal_CB_Append_TxnUpload failed:", error);
     context.closeWithFailure();
   }
 };

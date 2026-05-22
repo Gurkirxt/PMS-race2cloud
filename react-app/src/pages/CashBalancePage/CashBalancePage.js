@@ -149,11 +149,11 @@ function CashBalancePage() {
 
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
 
-  /* API returns newest-first; closing balance = balance after latest txn on this page */
+  /* Page 1, newest-first: first row = highest Sequence in filter; Cash_Balance from DB */
   const closingBalance = useMemo(() => {
-    if (!rows.length) return null;
+    if (!rows.length || currentPage !== 1) return null;
     return rows[0];
-  }, [rows]);
+  }, [rows, currentPage]);
 
   const [exportJobName, setExportJobName] = useState("");
   const [exportStatus, setExportStatus] = useState("");
@@ -485,11 +485,23 @@ function CashBalancePage() {
                               </td>
                               <td>{r.Quantity ?? "–"}</td>
                               <td>{r.Price != null ? formatINR(r.Price) : "–"}</td>
-                              <td className={Number(r.STT) ? "cash-debit" : ""}>
-                                {Number(r.STT) ? `- ${formatINR(r.STT)}` : "–"}
+                              <td className={Number(r.STT) < 0 ? "cash-debit" : Number(r.STT) > 0 ? "cash-credit" : ""}>
+                                {r.STT != null && r.STT !== "" && !Number.isNaN(Number(r.STT))
+                                  ? formatINR(r.STT)
+                                  : "–"}
                               </td>
-                              <td className={r.Debit ? "cash-debit" : r.Credit ? "cash-credit" : ""}>
-                                {r.Debit ? `- ${formatINR(r.Debit)}` : r.Credit ? `+ ${formatINR(r.Credit)}` : "–"}
+                              <td
+                                className={
+                                  Number(r.Total_Amount) < 0
+                                    ? "cash-debit"
+                                    : Number(r.Total_Amount) > 0
+                                      ? "cash-credit"
+                                      : ""
+                                }
+                              >
+                                {r.Total_Amount != null && r.Total_Amount !== "" && !Number.isNaN(Number(r.Total_Amount))
+                                  ? formatINR(r.Total_Amount)
+                                  : "–"}
                               </td>
                               <td className={`cash-col-balance ${balValid && bal >= 0 ? "cash-balance-positive" : ""} ${balValid && bal < 0 ? "cash-balance-negative" : ""}`}>
                                 {balValid ? formatINR(bal) : "–"}

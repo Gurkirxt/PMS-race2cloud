@@ -434,7 +434,8 @@ function extractDistinctBrokerAccountIsinPairsFromCsv(fileBuffer) {
  * 5. Uploads rewritten CSV to Stratus bucket client-transaction-files under transactions/.
  * 6. Inserts `Jobs` (RUNNING), runs Datastore bulk write → `Transaction`, polls to completion,
  *    then sets `Jobs` to COMPLETED (or FAILED). `jobName` is `TxnCsv_<ms>` matching `TxnUpload-<ms>-` in objectKey.
- * 7. Queues `CalculateHoldingsPerAccount` on UpdateMasters with `source: TxnUpload` and `pairsJson` (file pairs only; skips queue if none).
+ * 7. Queues `UpdatesSecurity_ClientMasters`, `CalculateHoldingsPerAccount`, and `Cal_CB_Append_TxnUpload`
+ *    (incremental cash passbook) on UpdateMasters. Full passbook rebuild: `Cal_CB_Per_TNX` (manual only).
  */
 export const uploadTempTransaction = async (req, res) => {
   let pipelineJobName = null;
@@ -598,6 +599,36 @@ export const uploadTempTransaction = async (req, res) => {
 
     await updateJobsStatus(zcqlForJob, pipelineJobName, "COMPLETED");
 
+    /* Masters sync (clientIds / Security_List) from uploaded CSV on Stratus. */
+    let mastersQueueJobName = null;
+    let mastersJobSkipped = false;
+
+    try {
+      const jobSchedulingForMasters = catalystApp.jobScheduling();
+      mastersQueueJobName = `USCM_${Date.now()}`.slice(0, 20);
+      await jobSchedulingForMasters.JOB.submitJob({
+        job_name: mastersQueueJobName,
+        jobpool_name: "UpdateMasters",
+        target_name: "UpdatesSecurity_ClientMasters",
+        target_type: "Function",
+        job_config: {
+          number_of_retries: 5,
+          retry_interval: 60 * 1000,
+        },
+        params: {
+          source: "TxnUpload",
+          bucketName: BUCKET_NAME,
+          objectKey,
+        },
+      });
+    } catch (mastersErr) {
+      mastersJobSkipped = true;
+      console.error(
+        "[TempTransactionUpload] Failed to queue UpdatesSecurity_ClientMasters:",
+        mastersErr,
+      );
+    }
+
     /* Serialize distinct pairs for scoped Holdings job (Catalyst param size cap). */
     let pairsForJob = scopePairsResult.pairs;
     let holdingsPairsJsonTruncated = false;
@@ -619,17 +650,46 @@ export const uploadTempTransaction = async (req, res) => {
       );
     }
 
-    /* Holdings rebuild: queue on UpdateMasters only when CSV has account/ISIN pairs. */
+    const accountCodesForCash = [
+      ...new Set(pairsForJob.map(([acc]) => String(acc ?? "").trim()).filter(Boolean)),
+    ].sort((a, b) => a.localeCompare(b));
+
+    let accountCodesJson = JSON.stringify(accountCodesForCash);
+    let cashAccountCodesJsonTruncated = false;
+    if (accountCodesJson.length > MAX_PAIRS_JSON_CHARS) {
+      cashAccountCodesJsonTruncated = true;
+      let trimmed = accountCodesForCash;
+      while (
+        trimmed.length > 1 &&
+        JSON.stringify(trimmed).length > MAX_PAIRS_JSON_CHARS
+      ) {
+        trimmed = trimmed.slice(
+          0,
+          Math.max(1, Math.floor(trimmed.length * 0.85)),
+        );
+      }
+      accountCodesJson = JSON.stringify(trimmed);
+      console.warn(
+        `[TempTransactionUpload] accountCodesJson trimmed to ${trimmed.length} account(s) (param size cap ${MAX_PAIRS_JSON_CHARS})`,
+      );
+    }
+
+    /* Holdings + incremental cash passbook: queue on UpdateMasters when CSV has pairs. */
     let holdingsQueueJobName = null;
     let holdingsJobSkipped = false;
+    let cashPassbookQueueJobName = null;
+    let cashPassbookJobSkipped = false;
+
     if (pairsForJob.length === 0) {
       holdingsJobSkipped = true;
+      cashPassbookJobSkipped = true;
       console.warn(
-        "[TempTransactionUpload] No BROKERACID/SYMBOLCODE pairs in CSV — skipping CalculateHoldingsPerAccount queue.",
+        "[TempTransactionUpload] No BROKERACID/SYMBOLCODE pairs in CSV — skipping Holdings and Cal_CB_Append_TxnUpload jobs.",
       );
     } else {
+      const jobScheduling = catalystApp.jobScheduling();
+
       try {
-        const jobScheduling = catalystApp.jobScheduling();
         holdingsQueueJobName = `CHPA_${Date.now()}`.slice(0, 20);
         await jobScheduling.JOB.submitJob({
           job_name: holdingsQueueJobName,
@@ -651,20 +711,55 @@ export const uploadTempTransaction = async (req, res) => {
           holdingsErr,
         );
       }
+
+      try {
+        cashPassbookQueueJobName = `CCB_${Date.now()}`.slice(0, 20);
+        await jobScheduling.JOB.submitJob({
+          job_name: cashPassbookQueueJobName,
+          jobpool_name: "UpdateMasters",
+          target_name: "Cal_CB_Append_TxnUpload",
+          target_type: "Function",
+          job_config: {
+            number_of_retries: 5,
+            retry_interval: 60 * 1000,
+          },
+          params: {
+            source: "TxnUpload",
+            accountCodesJson,
+            importStartedAtMs: String(uploadMs),
+          },
+        });
+      } catch (cashErr) {
+        cashPassbookJobSkipped = true;
+        console.error(
+          "[TempTransactionUpload] Failed to queue Cal_CB_Append_TxnUpload:",
+          cashErr,
+        );
+      }
     }
+
+    const jobsQueued =
+      !mastersJobSkipped || !holdingsJobSkipped || !cashPassbookJobSkipped;
+    const jobsMessage = !jobsQueued
+      ? "Transaction bulk import finished and Jobs is COMPLETED. Follow-up jobs were not queued."
+      : "Transaction bulk import finished and Jobs is COMPLETED. Masters, holdings, and/or incremental cash passbook jobs were queued as applicable.";
 
     /* ─── 4. RESPOND ──────────────────────────────────────────────── */
     return res.status(200).json({
       success: true,
-      message: holdingsJobSkipped
-        ? "Transaction bulk import finished and Jobs is COMPLETED. Holdings job was not queued (no account/ISIN pairs found in the CSV)."
-        : "Transaction bulk import finished and Jobs is COMPLETED. CalculateHoldingsPerAccount was queued for account/ISIN pairs from this file only.",
+      message: jobsMessage,
       pipelineJobName,
+      mastersQueueJobName,
+      mastersJobSkipped,
       holdingsQueueJobName,
       holdingsJobSkipped,
       holdingsDistinctPairs: pairsForJob.length,
       holdingsPairsTruncated: scopePairsResult.truncated,
       holdingsPairsJsonTruncated,
+      cashPassbookQueueJobName,
+      cashPassbookJobSkipped,
+      cashPassbookDistinctAccounts: accountCodesForCash.length,
+      cashAccountCodesJsonTruncated,
       fileName: file.name,
       objectKey,
       bucket: BUCKET_NAME,

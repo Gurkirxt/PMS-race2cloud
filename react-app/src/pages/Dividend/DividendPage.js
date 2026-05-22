@@ -19,6 +19,29 @@ const STATUS_LABEL = {
   missing_in_file: "Missing in file",
 };
 
+/** RFC 4180-style CSV cell (comma-safe). */
+function csvEscapeCell(value) {
+  const s = value == null ? "" : String(value);
+  if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function triggerCsvDownload(filename, csvBody) {
+  const bom = "\uFEFF";
+  const blob = new Blob([bom + csvBody], {
+    type: "text/csv;charset=utf-8;",
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 function DividendPage() {
   const [symbol, setSymbol] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
@@ -62,9 +85,6 @@ function DividendPage() {
   const [statusFilter, setStatusFilter] = useState("all");
   const [activeEvent, setActiveEvent] = useState(0);
   const [warnings, setWarnings] = useState([]);
-
-  const [exportDownloadUrl, setExportDownloadUrl] = useState("");
-  const [exportLoading, setExportLoading] = useState(false);
 
   const [applyJobName, setApplyJobName] = useState(null);
   const [applyStatus, setApplyStatus] = useState(null);
@@ -148,7 +168,6 @@ function DividendPage() {
 
           setTimeout(() => {
             setSuccess(false);
-            setExportDownloadUrl("");
             setPreviewData([]);
             setPreviewEmptyMessage("");
             setReconEvents(null);
@@ -283,53 +302,90 @@ function DividendPage() {
     }
   };
 
-  /** Export preview CSV – calls GET /dividend/export-preview and sets signed download URL */
-  const handleExportPreview = async () => {
-    setExportLoading(true);
-    setExportDownloadUrl("");
-    setError(null);
-    try {
-      /* recordDate used for calculation; exDate included for CSV display */
-      const params = new URLSearchParams({
-        isin,
-        recordDate: recordDate || "",
-        rate,
-        paymentDate: paymentDate || "",
-      });
-      if (exDate) params.set("exDate", exDate);
-      const res = await fetch(`${BASE_URL}/dividend/export-preview?${params.toString()}`, {
-        credentials: "include",
-      });
-      if (!res.ok) throw new Error("Export request failed");
-      const data = await res.json();
-      if (!data.success) throw new Error(data.message || "Export failed");
-      const signedUrl =
-        data.downloadUrl?.signature?.signature ?? data.downloadUrl?.signature;
-      if (!signedUrl) throw new Error("Download URL missing");
-      setExportDownloadUrl(signedUrl);
-    } catch (err) {
-      console.error(err);
-      setError(err.message || "Failed to export dividend preview CSV");
-    } finally {
-      setExportLoading(false);
-    }
-  };
-
-  /** Download generated export file – opens exportDownloadUrl when set by handleExportPreview */
-  const handleDownload = () => {
-    if (exportDownloadUrl) window.open(exportDownloadUrl, "_blank");
-  };
-
   /**
+   * Single Export: reconciliation CSV aligned with the on-screen grid
+   * (all CA events, all rows, all statuses; one Status column). Omits delta
+   * columns. CA_Ref / event Rate omitted per product request.
+   */
+  const handleExportReconciliationCsv = () => {
+    if (!reconEvents || reconEvents.length === 0) {
+      setError(
+        "Fetch affected accounts first — there is no reconciliation data to export.",
+      );
+      return;
+    }
+    const totalRows = reconEvents.reduce(
+      (n, evt) => n + (Array.isArray(evt.rows) ? evt.rows.length : 0),
+      0,
+    );
+    if (totalRows === 0) {
+      setError("No reconciliation rows to export.");
+      return;
+    }
+    setError(null);
+
+    const header = [
+      "Account_Code",
+      "Client_Name",
+      "Holding_PMS",
+      "Holding_File",
+      "Rate_PMS",
+      "Rate_File",
+      "Gross_PMS",
+      "Gross_File",
+      "CA_Tax_Amt",
+      "Net",
+      "Already_Received",
+      "Cash_Credited",
+      "To_Receive_Net",
+      "Status",
+    ];
+    const lines = [header.map(csvEscapeCell).join(",")];
+
+    for (const evt of reconEvents) {
+      const rows = Array.isArray(evt.rows) ? evt.rows : [];
+      for (const row of rows) {
+        if (!row) continue;
+        const statusLabel = STATUS_LABEL[row.status] || row.status || "";
+        lines.push(
+          [
+            row.accountCode ?? "",
+            row.clientName ?? "",
+            row.holdingSys ?? "",
+            row.holdingFile ?? "",
+            row.rateSys ?? "",
+            row.rateFile ?? "",
+            row.grossSys ?? "",
+            row.grossFile ?? "",
+            row.tdsFile ?? "",
+            row.netFile ?? "",
+            row.alreadyReceivedGross ?? "",
+            row.alreadyCreditedCash ? "Yes" : "No",
+            row.toReceiveNet ?? "",
+            statusLabel,
+          ]
+            .map(csvEscapeCell)
+            .join(","),
+        );
+      }
+    }
+
+    const safeIsin = String(isin || "isin").replace(/[^\w.-]+/g, "_");
+    const safeDate = String(recordDate || "record").replace(/[^\d-]+/g, "");
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    triggerCsvDownload(
+      `Dividend_recon_${safeIsin}_${safeDate}_${stamp}.csv`,
+      lines.join("\r\n"),
+    );
+  };
+
+  /*
    * Apply dividend (called from preview section after fetch).
    *
    * Submits a Catalyst Job via the AppSail controller. The controller returns
    * { jobName, status: "PENDING" } immediately; the polling useEffect above
    * then polls /dividend/apply-status until COMPLETED / FAILED / ERROR.
    * `loading` stays true for the entire duration so the button shows "Applying…".
-   */
-  /*
-   * Apply dividend.
    *
    * mode:
    *   "system"  – legacy behaviour, no account filter, FIFO universe.
@@ -718,37 +774,37 @@ function DividendPage() {
                 { key: "all", label: "All", count: activeEventObj.rowCount },
                 {
                   key: "ready",
-                  label: "🟢 Matched",
+                  label: "Matched",
                   count: activeEventObj.rows.filter((r) => r.status === "ready").length,
                 },
                 {
                   key: "mismatch",
-                  label: "🟡 Mismatch",
+                  label: "Mismatch",
                   count: activeEventObj.rows.filter((r) => r.status === "mismatch").length,
                 },
                 {
                   key: "partial",
-                  label: "🟠 Partial",
+                  label: "Partial",
                   count: activeEventObj.rows.filter((r) => r.status === "partial").length,
                 },
                 {
                   key: "overpaid",
-                  label: "🔴 Over-paid",
+                  label: "Over-paid",
                   count: activeEventObj.rows.filter((r) => r.status === "overpaid").length,
                 },
                 {
                   key: "already_paid",
-                  label: "✅ Already paid",
+                  label: "Already paid",
                   count: activeEventObj.rows.filter((r) => r.status === "already_paid").length,
                 },
                 {
                   key: "missing_in_system",
-                  label: "🟣 Missing in system",
+                  label: "Missing in system",
                   count: activeEventObj.rows.filter((r) => r.status === "missing_in_system").length,
                 },
                 {
                   key: "missing_in_file",
-                  label: "🟣 Missing in file",
+                  label: "Missing in file",
                   count: activeEventObj.rows.filter((r) => r.status === "missing_in_file").length,
                 },
               ]
@@ -805,9 +861,7 @@ function DividendPage() {
                     <td>
                       <div style={{ fontWeight: 600 }}>{row.accountCode}</div>
                       {row.clientName && (
-                        <div style={{ fontSize: 11, color: "#6b7280" }}>
-                          {row.clientName}
-                        </div>
+                        <div className="recon-account-subtitle">{row.clientName}</div>
                       )}
                     </td>
                     <td>
@@ -845,16 +899,14 @@ function DividendPage() {
                     </td>
                     <td>{row.tdsFile ?? "—"}</td>
                     <td style={{ fontWeight: 600 }}>{row.netFile ?? "—"}</td>
-                    <td>
+                    <td
+                      title={
+                        row.alreadyCreditedCash
+                          ? "DIVIDEND cash credit recorded for this record date"
+                          : undefined
+                      }
+                    >
                       {row.alreadyReceivedGross || 0}
-                      {row.alreadyCreditedCash && (
-                        <span
-                          title="Cash credit row exists"
-                          style={{ marginLeft: 6 }}
-                        >
-                          ✅
-                        </span>
-                      )}
                     </td>
                     <td style={{ fontWeight: 600 }}>{row.toReceiveNet}</td>
                     <td>
@@ -900,18 +952,17 @@ function DividendPage() {
             <button
               type="button"
               className="dividend-submit"
-              disabled={exportLoading}
-              onClick={handleExportPreview}
+              disabled={
+                !reconEvents ||
+                reconEvents.length === 0 ||
+                reconEvents.every(
+                  (e) => !Array.isArray(e.rows) || e.rows.length === 0,
+                )
+              }
+              onClick={handleExportReconciliationCsv}
+              title="Download reconciliation CSV (same rows as the grid; delta columns omitted)."
             >
-              {exportLoading ? "Generating..." : "Export"}
-            </button>
-            <button
-              type="button"
-              className="dividend-submit"
-              disabled={!exportDownloadUrl}
-              onClick={handleDownload}
-            >
-              Download
+              Export
             </button>
 
             {/*

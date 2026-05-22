@@ -3,38 +3,6 @@ const catalyst = require("zcatalyst-sdk-node");
 
 const esc = (s) => String(s ?? "").replace(/'/g, "''");
 
-/** Must match appsail-nodejs/controller/cashBalance/cashPassbookController.js (passbook UI). */
-const CASH_ADD = [
-  "CS+",
-  "SL+",
-  "CSI",
-  "IN1",
-  "IN+",
-  "DIO",
-  "DI0",
-  "DI1",
-  "OI1",
-  "DIS",
-  "SQS",
-  "DIVIDEND",
-];
-const CASH_SUBTRACT = [
-  "BY-",
-  "CS-",
-  "MGF",
-  "E22",
-  "E01",
-  "CUS",
-  "E23",
-  "MGE",
-  "E10",
-  "PRF",
-  "NF-",
-  "SQB",
-  "TDO",
-  "TDI",
-];
-
 /** yyyy-mm-dd -> yyyy/mm/dd for CSV DATE column */
 function formatDateSlash(yyyyMmDd) {
   const parts = String(yyyyMmDd || "").split("-");
@@ -99,59 +67,30 @@ async function getDistinctAccountCodesFromCash(zcql, asOnDate) {
 }
 
 /**
- * Closing cash as on date — same recomputed balance as Cash Balance passbook UI (paise walk).
- * Reads Transaction_Type / Total_Amount / STT only; ignores stored Cash_Balance column.
+ * Closing cash as on date — stored Cash_Balance on the latest Sequence row
+ * before the as-on cutoff (same as Cash Balance passbook UI).
  */
-async function computedClosingForAccount(zcql, accountCode, asOnDate) {
+async function storedClosingForAccount(zcql, accountCode, asOnDate) {
   const nextDayStr = nextDayIso(asOnDate);
-  const BATCH = 300;
-  let offset = 0;
-  let runBalP = 0;
-  let isFirstRecord = true;
+  const rows = await zcql.executeZCQLQuery(`
+    SELECT Cash_Balance FROM Cash_Balance_Per_Transaction
+    WHERE Account_Code = '${esc(accountCode)}'
+      AND Transaction_Date < '${nextDayStr}'
+    ORDER BY Sequence DESC
+    LIMIT 1
+  `);
 
-  const toPaise = (n) => Math.round(n * 100);
-  const fromPaise = (p) => Number((p / 100).toFixed(2));
-
-  while (true) {
-    const rows = await zcql.executeZCQLQuery(`
-      SELECT Transaction_Type, Total_Amount, STT
-      FROM Cash_Balance_Per_Transaction
-      WHERE Account_Code = '${esc(accountCode)}'
-        AND Transaction_Date < '${nextDayStr}'
-      ORDER BY Sequence ASC
-      LIMIT ${offset}, ${BATCH}
-    `);
-
-    if (!rows || rows.length === 0) break;
-
-    for (const r of rows) {
-      const row = r.Cash_Balance_Per_Transaction || r;
-      const tranType = row.Transaction_Type || "";
-      const amtP = toPaise(Math.abs(Number(row.Total_Amount) || 0));
-      const sttP = toPaise(Math.abs(Number(row.STT) || 0));
-
-      if (isFirstRecord && tranType === "CS+") {
-        runBalP = amtP - sttP;
-        isFirstRecord = false;
-      } else if (CASH_ADD.includes(tranType)) {
-        runBalP += amtP - sttP;
-      } else if (CASH_SUBTRACT.includes(tranType)) {
-        runBalP -= amtP + sttP;
-      }
-    }
-
-    if (isFirstRecord && rows.length > 0) isFirstRecord = false;
-
-    if (rows.length < BATCH) break;
-    offset += rows.length;
+  if (!rows || rows.length === 0) {
+    return { balance: 0 };
   }
 
-  return { balance: fromPaise(runBalP) };
+  const row = rows[0].Cash_Balance_Per_Transaction || rows[0];
+  return { balance: Number(row.Cash_Balance) || 0 };
 }
 
 /**
  * All-clients cash snapshot → CSV (DATE, ACCOUNT CODE, CASH BALANCE).
- * Per account: recomputed closing balance (Cash Balance page logic) on rows with Transaction_Date < day after as-on.
+ * Per account: stored Cash_Balance on latest Sequence before as-on (Cash Balance page logic).
  * DATE column is always the job as-on date (yyyy/mm/dd) on every row.
  * Accounts: every distinct Account_Code that has any passbook row before that cutoff.
  * @param {import("./types/job").JobRequest} jobRequest
@@ -190,7 +129,7 @@ module.exports = async (jobRequest, context) => {
 
     for (const accountCode of accountCodes) {
       try {
-        const { balance } = await computedClosingForAccount(
+        const { balance } = await storedClosingForAccount(
           zcql,
           accountCode,
           asOnDate
