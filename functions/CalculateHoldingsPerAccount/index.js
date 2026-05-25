@@ -3,9 +3,10 @@
  *
  * This is the job deployment (type job) mirroring the former event function logic.
  *
- * Reads Transaction (+ Bonus, Split, Demerger_Record, Merger), runs the same FIFO
- * engine as AppSail analytics (`util/analytics/transactionHistory/fifo.js`), and
- * materializes the per-(account, ISIN) FIFO timeline into the Holdings table.
+ * Reads Transaction only, runs the same FIFO engine as AppSail analytics
+ * (`util/analytics/transactionHistory/fifo.js`) for buy/sell events, and materializes
+ * the per-(account, ISIN) FIFO timeline into the Holdings table.
+ * Bonus / Split / Demerger / Merger are not loaded here — supply via other methods later.
  *
  * Holdings columns it writes:
  *   WS_Account_code, TRANSACTION_DATE, SETTLEMENT_DATE, TYPE, ISIN,
@@ -14,12 +15,11 @@
  * Row order within a pair is preserved by INSERT order — reads should use the same ORDER BY
  * as AppSail `HOLDINGS_FIFO_ORDER_BY_SQL` (`CREATEDTIME ASC, ROWID ASC`), not settlement-only.
  *
- * Mirrors `getHoldingsSummarySimple`:
- *   - One paged read of Transaction / Bonus per account (NOT per pair).
- *   - One Demerger_Record / Merger fetch per account.
- *   - One IN-clause read of Split for all ISINs in the account.
- *   - Skips ISINs that have been merged away (via Merger.OldISIN) so the
- *     Holdings table matches what the dashboard chooses to display.
+ * Per account: one paged read of Transaction (NOT per pair), then FIFO per ISIN.
+ *
+ * TxnUpload (`source=TxnUpload` + `pairsJson`): append mode — FIFO replays all
+ * transactions for the ISIN (correct sells), then INSERT only new tail rows into
+ * Holdings (no DELETE). Full rebuild when not TxnUpload or when tail is shorter than existing.
  *
  * Configure ACCOUNTS_FILTER / ISINS_FILTER / MAX_PAIRS / DRY_RUN below for test
  * runs. Deploy and invoke from the Catalyst console (or via the configured
@@ -125,6 +125,21 @@ function getJobSource(jobRequest) {
     console.warn("getJobSource:", e.message);
   }
   return "";
+}
+
+function parseImportStartedAtMs(jobRequest) {
+  try {
+    if (!jobRequest || typeof jobRequest.getAllJobParams !== "function") {
+      return 0;
+    }
+    const p = jobRequest.getAllJobParams() || {};
+    const raw = p.importStartedAtMs ?? p.import_started_at_ms;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+  } catch (e) {
+    console.warn("parseImportStartedAtMs:", e.message);
+    return 0;
+  }
 }
 
 function rowFromJobStatusRow(r) {
@@ -291,7 +306,7 @@ async function fetchAccountTransactions(zcql, accountCode, asOnDate) {
   while (true) {
     try {
       const batch = await zcql.executeZCQLQuery(`
-        SELECT SETDATE, TRANDATE, Tran_Type, Security_Name, Security_code, QTY, NETRATE, Net_Amount, ISIN, ROWID
+        SELECT TRANDATE, SETDATE, Tran_Type, QTY, NETRATE, Net_Amount, ISIN, ROWID
         FROM Transaction
         WHERE WS_Account_code = '${esc(accountCode)}'
         ${dateClause}
@@ -319,158 +334,6 @@ async function fetchAccountTransactions(zcql, accountCode, asOnDate) {
         return !d || d < cutoff;
       })
     : rows;
-}
-
-async function fetchAccountBonuses(zcql, accountCode, asOnDate) {
-  const cutoff = nextDayCutoff(asOnDate);
-  const dateClause = cutoff ? ` AND ExDate < '${cutoff}'` : "";
-
-  const rows = [];
-  const seen = new Set();
-  let offset = 0;
-  while (true) {
-    try {
-      const batch = await zcql.executeZCQLQuery(`
-        SELECT SecurityCode, SecurityName, ExDate, BonusShare, ISIN, ROWID
-        FROM Bonus
-        WHERE WS_Account_code = '${esc(accountCode)}'
-        ${dateClause}
-        ORDER BY ExDate ASC, ROWID ASC
-        LIMIT ${BATCH} OFFSET ${offset}
-      `);
-      if (!batch || batch.length === 0) break;
-      for (const row of batch) {
-        const b = row.Bonus || row;
-        if (b.ROWID && seen.has(b.ROWID)) continue;
-        if (b.ROWID) seen.add(b.ROWID);
-        rows.push(b);
-      }
-      if (batch.length < BATCH) break;
-      offset += BATCH;
-    } catch (err) {
-      console.error(`fetchAccountBonuses[${accountCode}] offset=${offset}:`, err.message);
-      break;
-    }
-  }
-  return rows;
-}
-
-async function fetchAccountDemergers(zcql, accountCode, asOnDate) {
-  const cutoff = nextDayCutoff(asOnDate);
-  const dateClause = cutoff
-    ? ` AND (TRANDATE < '${cutoff}' OR SETDATE < '${cutoff}')`
-    : "";
-
-  const rows = [];
-  const seen = new Set();
-  let offset = 0;
-  while (true) {
-    try {
-      const batch = await zcql.executeZCQLQuery(`
-        SELECT *
-        FROM Demerger_Record
-        WHERE WS_Account_code = '${esc(accountCode)}'
-        ${dateClause}
-        ORDER BY TRANDATE ASC, ROWID ASC
-        LIMIT ${BATCH} OFFSET ${offset}
-      `);
-      if (!batch || batch.length === 0) break;
-      for (const row of batch) {
-        const d = row.Demerger_Record || row;
-        if (d.ROWID != null && seen.has(d.ROWID)) continue;
-        if (d.ROWID != null) seen.add(d.ROWID);
-        rows.push(d);
-      }
-      if (batch.length < BATCH) break;
-      offset += BATCH;
-    } catch (err) {
-      console.error(`fetchAccountDemergers[${accountCode}] offset=${offset}:`, err.message);
-      break;
-    }
-  }
-  return rows.filter(
-    (d) => String(d.Tran_Type || d.tran_type || "").toUpperCase() === "DEMERGER",
-  );
-}
-
-async function fetchAccountMergers(zcql, accountCode, asOnDate) {
-  const cutoff = nextDayCutoff(asOnDate);
-  const dateClause = cutoff
-    ? ` AND (TRANDATE < '${cutoff}' OR SETDATE < '${cutoff}')`
-    : "";
-
-  const rows = [];
-  const seen = new Set();
-  let offset = 0;
-  while (true) {
-    try {
-      const batch = await zcql.executeZCQLQuery(`
-        SELECT *
-        FROM Merger
-        WHERE WS_Account_code = '${esc(accountCode)}'
-        ${dateClause}
-        ORDER BY TRANDATE ASC, ROWID ASC
-        LIMIT ${BATCH} OFFSET ${offset}
-      `);
-      if (!batch || batch.length === 0) break;
-      for (const row of batch) {
-        const m = row.Merger || row;
-        if (m.ROWID != null && seen.has(m.ROWID)) continue;
-        if (m.ROWID != null) seen.add(m.ROWID);
-        rows.push(m);
-      }
-      if (batch.length < BATCH) break;
-      offset += BATCH;
-    } catch (err) {
-      console.error(`fetchAccountMergers[${accountCode}] offset=${offset}:`, err.message);
-      break;
-    }
-  }
-  return rows.filter(
-    (m) => String(m.Tran_Type || m.tran_type || "").toUpperCase() === "MERGER",
-  );
-}
-
-async function fetchSplitsForIsins(zcql, isins, asOnDate) {
-  if (!isins || !isins.length) return [];
-  const cutoff = nextDayCutoff(asOnDate);
-  const dateClause = cutoff ? ` AND Issue_Date < '${cutoff}'` : "";
-  const inClause = isins.map((i) => `'${esc(i)}'`).join(",");
-
-  const rows = [];
-  const seen = new Set();
-  let offset = 0;
-  while (true) {
-    try {
-      const batch = await zcql.executeZCQLQuery(`
-        SELECT Security_Code, Security_Name, Issue_Date, Ratio1, Ratio2, ISIN, ROWID
-        FROM Split
-        WHERE ISIN IN (${inClause})
-        ${dateClause}
-        ORDER BY Issue_Date ASC, ROWID ASC
-        LIMIT ${BATCH} OFFSET ${offset}
-      `);
-      if (!batch || batch.length === 0) break;
-      for (const row of batch) {
-        const s = row.Split || row;
-        if (s.ROWID && seen.has(s.ROWID)) continue;
-        if (s.ROWID) seen.add(s.ROWID);
-        rows.push(s);
-      }
-      if (batch.length < BATCH) break;
-      offset += BATCH;
-    } catch (err) {
-      console.error(`fetchSplitsForIsins offset=${offset}:`, err.message);
-      break;
-    }
-  }
-
-  return rows.map((s) => ({
-    ratio1: Number(s.Ratio1) || 0,
-    ratio2: Number(s.Ratio2) || 0,
-    issueDate: s.Issue_Date,
-    isin: s.ISIN || "",
-  }));
 }
 
 /* ============================== FIFO ENGINE (mirror of analytics fifo.js) ============================== */
@@ -939,6 +802,115 @@ async function deleteHoldingsForPair(zcql, accountCode, isin) {
   `);
 }
 
+/** Row count for append mode (same order as reads: CREATEDTIME ASC, ROWID ASC). */
+async function countHoldingsRowsForPair(zcql, accountCode, isin) {
+  let count = 0;
+  let offset = 0;
+  while (true) {
+    const batch = await zcql.executeZCQLQuery(`
+      SELECT ROWID FROM Holdings
+      WHERE WS_Account_code = '${esc(accountCode)}' AND ISIN = '${esc(isin)}'
+      ORDER BY CREATEDTIME ASC, ROWID ASC
+      LIMIT ${BATCH} OFFSET ${offset}
+    `);
+    if (!batch || batch.length === 0) break;
+    count += batch.length;
+    if (batch.length < BATCH) break;
+    offset += BATCH;
+  }
+  return count;
+}
+
+/**
+ * Full rebuild (delete + insert all) or TxnUpload append (insert tail only after FIFO replay).
+ * @param {{ appendOnly?: boolean }} writeOpts
+ */
+async function writeHoldingsForPair(
+  zcql,
+  accountCode,
+  isin,
+  fifoRows,
+  counters,
+  writeOpts = {},
+) {
+  const appendOnly = Boolean(writeOpts.appendOnly);
+  const rowCount = Array.isArray(fifoRows) ? fifoRows.length : 0;
+
+  if (DRY_RUN) {
+    if (appendOnly && rowCount > 0) {
+      const existing = await countHoldingsRowsForPair(zcql, accountCode, isin);
+      const appendN = Math.max(0, rowCount - existing);
+      console.log(
+        `[DRY_RUN][${accountCode}/${isin}] would append ${appendN} row(s) (${existing} existing, ${rowCount} fifo)`,
+      );
+      counters.rows += appendN;
+    } else {
+      console.log(
+        `[DRY_RUN][${accountCode}/${isin}] would write ${rowCount} row(s)`,
+      );
+      counters.rows += rowCount;
+    }
+    return;
+  }
+
+  if (!rowCount) {
+    if (!appendOnly) {
+      try {
+        await deleteHoldingsForPair(zcql, accountCode, isin);
+      } catch (err) {
+        console.error(`[${accountCode}/${isin}] delete (empty) failed:`, err.message);
+        counters.errors++;
+      }
+    }
+    return;
+  }
+
+  try {
+    if (appendOnly) {
+      const existingCount = await countHoldingsRowsForPair(zcql, accountCode, isin);
+
+      if (rowCount < existingCount) {
+        console.warn(
+          `[${accountCode}/${isin}] FIFO ${rowCount} row(s) < Holdings ${existingCount} — full rebuild`,
+        );
+        await deleteHoldingsForPair(zcql, accountCode, isin);
+        for (const r of fifoRows) {
+          await insertHoldingsRow(zcql, accountCode, r, isin);
+        }
+        counters.rows += rowCount;
+        return;
+      }
+
+      if (rowCount === existingCount) {
+        console.log(`[${accountCode}/${isin}] append: no new Holdings rows`);
+        return;
+      }
+
+      const toAppend = fifoRows.slice(existingCount);
+      for (const r of toAppend) {
+        await insertHoldingsRow(zcql, accountCode, r, isin);
+      }
+      counters.rows += toAppend.length;
+      console.log(
+        `[${accountCode}/${isin}] appended ${toAppend.length} row(s) (${existingCount} unchanged)`,
+      );
+      return;
+    }
+
+    await deleteHoldingsForPair(zcql, accountCode, isin);
+    for (const r of fifoRows) {
+      await insertHoldingsRow(zcql, accountCode, r, isin);
+    }
+    counters.rows += rowCount;
+  } catch (err) {
+    console.error(
+      `[${accountCode}/${isin}] ${appendOnly ? "append" : "rebuild"} failed:`,
+      err.message,
+    );
+    counters.errors++;
+  }
+}
+
 async function insertHoldingsRow(zcql, accountCode, row, displayIsin) {
   const txD = sqlDate(row.originalTrandate || row.trandate);
   const setD = sqlDate(row.setdate || row.trandate);
@@ -985,19 +957,14 @@ async function rebuildHoldingsForAccount(
   asOnDate,
   counters,
   scopedIsinsSet = null,
+  writeOpts = {},
 ) {
   const t0 = Date.now();
 
   const transactions = await fetchAccountTransactions(zcql, accountCode, asOnDate);
-  const bonuses = await fetchAccountBonuses(zcql, accountCode, asOnDate);
-  const demergers = await fetchAccountDemergers(zcql, accountCode, asOnDate);
-  const mergers = await fetchAccountMergers(zcql, accountCode, asOnDate);
 
   const isins = new Set();
   for (const t of transactions) if (t.ISIN) isins.add(t.ISIN);
-  for (const b of bonuses) if (b.ISIN) isins.add(b.ISIN);
-  for (const d of demergers) if (d.ISIN) isins.add(d.ISIN);
-  for (const m of mergers) if (m.ISIN) isins.add(m.ISIN);
 
   let isinList = [...isins];
   if (!scopedIsinsSet || scopedIsinsSet.size === 0) {
@@ -1007,61 +974,23 @@ async function rebuildHoldingsForAccount(
     }
   }
 
-  const splitQueryIsins =
-    scopedIsinsSet && scopedIsinsSet.size > 0
-      ? [...scopedIsinsSet].filter(Boolean)
-      : isinList;
-  const splits = await fetchSplitsForIsins(zcql, splitQueryIsins, asOnDate);
-
-  // Match dashboard behavior: ISINs that appear as Merger.OldISIN are merged
-  // away — the surviving (new) ISIN is used instead.
-  const mergedAwayIsins = new Set();
-  for (const m of mergers) {
-    const oldIsin = String(m.OldISIN || m.oldIsin || "").trim();
-    if (oldIsin) mergedAwayIsins.add(oldIsin);
-  }
-
-  // Group inputs by ISIN.
   const txByIsin = {};
-  const bonusByIsin = {};
-  const splitByIsin = {};
-  const demergerByIsin = {};
-  const mergerByIsin = {};
-
   for (const t of transactions) {
     if (!t.ISIN) continue;
     (txByIsin[t.ISIN] = txByIsin[t.ISIN] || []).push(t);
   }
-  for (const b of bonuses) {
-    if (!b.ISIN) continue;
-    (bonusByIsin[b.ISIN] = bonusByIsin[b.ISIN] || []).push(b);
-  }
-  for (const s of splits) {
-    if (!s.isin) continue;
-    (splitByIsin[s.isin] = splitByIsin[s.isin] || []).push(s);
-  }
-  for (const d of demergers) {
-    if (!d.ISIN) continue;
-    (demergerByIsin[d.ISIN] = demergerByIsin[d.ISIN] || []).push(d);
-  }
-  for (const m of mergers) {
-    if (!m.ISIN) continue;
-    (mergerByIsin[m.ISIN] = mergerByIsin[m.ISIN] || []).push(m);
-  }
 
   let targetIsins;
   if (scopedIsinsSet && scopedIsinsSet.size > 0) {
-    targetIsins = [...scopedIsinsSet]
-      .filter((i) => i && !mergedAwayIsins.has(i))
-      .sort((a, b) => a.localeCompare(b));
+    targetIsins = [...scopedIsinsSet].filter(Boolean).sort((a, b) => a.localeCompare(b));
   } else {
-    targetIsins = isinList.filter((i) => !mergedAwayIsins.has(i));
+    targetIsins = isinList;
   }
 
   console.log(
-    `[${accountCode}] tx=${transactions.length} bon=${bonuses.length} ` +
-      `spl=${splits.length} dmg=${demergers.length} mrg=${mergers.length} ` +
+    `[${accountCode}] tx=${transactions.length} ` +
       `scoped=${scopedIsinsSet && scopedIsinsSet.size > 0 ? scopedIsinsSet.size : "off"} ` +
+      `append=${writeOpts.appendOnly ? "yes" : "no"} ` +
       `pairs=${targetIsins.length} (fetched in ${Date.now() - t0}ms)`,
   );
 
@@ -1075,50 +1004,14 @@ async function rebuildHoldingsForAccount(
 
     let fifoRows;
     try {
-      fifoRows = runFifoEngine(
-        txByIsin[isin] || [],
-        bonusByIsin[isin] || [],
-        splitByIsin[isin] || [],
-        false,
-        demergerByIsin[isin] || [],
-        mergerByIsin[isin] || [],
-      );
+      fifoRows = runFifoEngine(txByIsin[isin] || [], [], [], false, [], []);
     } catch (err) {
       console.error(`[${accountCode}/${isin}] FIFO failed:`, err.message);
       counters.errors++;
       continue;
     }
 
-    const rowCount = Array.isArray(fifoRows) ? fifoRows.length : 0;
-
-    if (DRY_RUN) {
-      console.log(
-        `[DRY_RUN][${accountCode}/${isin}] would write ${rowCount} row(s)`,
-      );
-      counters.rows += rowCount;
-      continue;
-    }
-
-    if (!rowCount) {
-      try {
-        await deleteHoldingsForPair(zcql, accountCode, isin);
-      } catch (err) {
-        console.error(`[${accountCode}/${isin}] delete (empty) failed:`, err.message);
-        counters.errors++;
-      }
-      continue;
-    }
-
-    try {
-      await deleteHoldingsForPair(zcql, accountCode, isin);
-      for (const r of fifoRows) {
-        await insertHoldingsRow(zcql, accountCode, r, isin);
-      }
-      counters.rows += rowCount;
-    } catch (err) {
-      console.error(`[${accountCode}/${isin}] rebuild failed:`, err.message);
-      counters.errors++;
-    }
+    await writeHoldingsForPair(zcql, accountCode, isin, fifoRows, counters, writeOpts);
   }
 }
 
@@ -1137,6 +1030,7 @@ module.exports = async (jobRequest, context) => {
   try {
     const scopedPairs = parseScopedPairsFromJob(jobRequest);
     const fromTxnUpload = getJobSource(jobRequest) === HOLDINGS_UPLOAD_SOURCE;
+    const importStartedAtMs = parseImportStartedAtMs(jobRequest);
     const counters = { pairs: 0, rows: 0, errors: 0 };
 
     if (fromTxnUpload && scopedPairs.length === 0) {
@@ -1158,7 +1052,9 @@ module.exports = async (jobRequest, context) => {
       console.log(
         `CalculateHoldingsPerAccount scoped: ${scopedPairs.length} distinct pair(s) across ${byAccount.size} account(s) | ` +
           `AS_ON_DATE=${AS_ON_DATE ?? "null"} | DRY_RUN=${DRY_RUN} | ` +
-          `MAX_PAIRS=${MAX_PAIRS} | jobTracking=${trackingOn ? `"${trackingJobName}"` : "off"}`,
+          `MAX_PAIRS=${MAX_PAIRS} | append=${fromTxnUpload ? "yes" : "no"} ` +
+          `importStartedAtMs=${importStartedAtMs || "n/a"} | ` +
+          `jobTracking=${trackingOn ? `"${trackingJobName}"` : "off"}`,
       );
 
       if (trackingOn) {
@@ -1197,6 +1093,7 @@ module.exports = async (jobRequest, context) => {
             AS_ON_DATE,
             counters,
             isinSet,
+            { appendOnly: fromTxnUpload },
           );
           if (trackingOn) {
             if (counters.errors > errsBeforeAccount) {

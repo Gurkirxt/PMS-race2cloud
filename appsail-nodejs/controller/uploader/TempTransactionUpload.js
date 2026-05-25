@@ -703,6 +703,7 @@ export const uploadTempTransaction = async (req, res) => {
           params: {
             source: "TxnUpload",
             pairsJson,
+            importStartedAtMs: String(uploadMs),
           },
         });
       } catch (holdingsErr) {
