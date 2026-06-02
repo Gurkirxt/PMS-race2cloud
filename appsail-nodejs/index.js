@@ -1,7 +1,7 @@
 import Express from "express";
 const app = Express();
 const port = process.env.X_ZOHO_CATALYST_LISTEN_PORT || 9000;
-import cors from "cors";
+//import cors from "cors";
 
 import AnalyticsRouter from "./router/AnalyticsRouter.js";
 import TransactionsRouter from "./router/TransactionRouter.js";
@@ -18,7 +18,7 @@ import DividendUploaderRouter from "./router/uploaderRouter/DividendUploaderRout
 import IsinRouter from "./router/IsinRouter.js";
 import DemergerRouter from "./router/DemergerRouter.js";
 import MergerRouter from "./router/MergerRouter.js";
-
+/**
 app.use(
   cors({
     origin: "http://localhost:3000",
@@ -26,7 +26,7 @@ app.use(
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
-); 
+);**/
 app.use(Express.json());
 app.use(Express.urlencoded({ extended: true }));
 

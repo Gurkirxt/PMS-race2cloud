@@ -33,7 +33,8 @@
       "UpdateDividendData",
       "DemergerFn",
       "RebuildHoldingtable",
-      "CalculateHoldingsPerAccount"
+      "CalculateHoldingWorkers",
+      "CalculateHoldingMaster"
     ],
     "ignore": [],
     "source": "functions"
