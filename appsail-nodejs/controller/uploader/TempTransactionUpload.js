@@ -271,9 +271,40 @@ function targetsForHeader(mapped) {
   return Array.isArray(mapped) ? mapped : [mapped];
 }
 
+/** Round to 4 dp to keep derived NETRATE / Net_Amount free of float noise. */
+function round4(n) {
+  return Math.round((Number(n) + Number.EPSILON) * 1e4) / 1e4;
+}
+
+/** Buy-side trade types: brokerage adds to cost. Everything else: brokerage reduces proceeds. */
+function isBuyTransType(tranType) {
+  return /^BY-|SQB|OPI/i.test(String(tranType ?? "").trim());
+}
+
+/**
+ * Derive NETRATE / Net_Amount from the raw broker columns. Used when the current
+ * broker file format leaves the NETRATE / Net_Amount filler columns blank.
+ * Convention matches the historical rows already in `Transaction`:
+ *   NETRATE    = RATE ± BROKERAGEPERSHARE   (+ for buys, − for sells)
+ *   Net_Amount = QTY × NETRATE
+ * STT (TRANEXPENSE) and SERVICETAX stay in their own columns — not folded in.
+ * Returns "" for both when RATE is absent (nothing to derive).
+ */
+function deriveNetRateAndAmount({ tranType, qty, rate, brokeragePerShare }) {
+  const r = Number(rate) || 0;
+  if (!r) return { netRate: "", netAmount: "" };
+  const b = Number(brokeragePerShare) || 0;
+  const q = Math.abs(Number(qty) || 0);
+  const netRate = round4(isBuyTransType(tranType) ? r + b : r - b);
+  const netAmount = round4(q * netRate);
+  return { netRate: String(netRate), netAmount: String(netAmount) };
+}
+
 /**
  * Rewrites CSV for bulk insert: maps template headers to Transaction column names;
  * one source column can fill multiple DB columns. Unmapped template columns (e.g. SETDATEFLAG, MKTRATE, third filler) dropped.
+ * When the file's NETRATE / Net_Amount filler columns are blank, they are derived
+ * automatically from RATE / BROKERAGEPERSHARE / QTY / TRANSTYPE (see deriveNetRateAndAmount).
  */
 function normalizeCsvForBulkUpload(fileBuffer) {
   const text = stripBom(fileBuffer.toString("utf8"));
@@ -295,6 +326,14 @@ function normalizeCsvForBulkUpload(fileBuffer) {
     }
   }
 
+  // Source column positions for auto-deriving NETRATE / Net_Amount. The header is
+  // validated against the fixed template before this runs, so these always exist.
+  const srcIdx = (name) => originalHeaders.indexOf(name);
+  const typeIdx = srcIdx("TRANSTYPE");
+  const qtyIdx = srcIdx("QUANTITY");
+  const rateIdx = srcIdx("RATE");
+  const brokIdx = srcIdx("BROKERAGEPERSHARE");
+
   const newHeaders = headerMappings.flatMap((m) => m.targets);
   const outSep = ",";
   const newLines = [newHeaders.join(outSep)];
@@ -303,10 +342,23 @@ function normalizeCsvForBulkUpload(fileBuffer) {
     const line = lines[r];
     if (!line.trim()) continue;
     const cells = splitLine(line);
+    const cellAt = (i) => (i >= 0 && i < cells.length ? cells[i] : "");
+
+    // Auto-fill NETRATE / Net_Amount when the broker file leaves them blank.
+    const derived = deriveNetRateAndAmount({
+      tranType: cellAt(typeIdx),
+      qty: cellAt(qtyIdx),
+      rate: cellAt(rateIdx),
+      brokeragePerShare: cellAt(brokIdx),
+    });
+
     const outCells = [];
     for (const m of headerMappings) {
-      const v = m.idx < cells.length ? cells[m.idx] : "";
-      for (let t = 0; t < m.targets.length; t++) {
+      const raw = m.idx < cells.length ? cells[m.idx] : "";
+      for (const target of m.targets) {
+        let v = raw;
+        if (v === "" && target === "NETRATE") v = derived.netRate;
+        else if (v === "" && target === "Net_Amount") v = derived.netAmount;
         outCells.push(v);
       }
     }
@@ -434,7 +486,7 @@ function extractDistinctBrokerAccountIsinPairsFromCsv(fileBuffer) {
  * 5. Uploads rewritten CSV to Stratus bucket client-transaction-files under transactions/.
  * 6. Inserts `Jobs` (RUNNING), runs Datastore bulk write → `Transaction`, polls to completion,
  *    then sets `Jobs` to COMPLETED (or FAILED). `jobName` is `TxnCsv_<ms>` matching `TxnUpload-<ms>-` in objectKey.
- * 7. Queues `UpdatesSecurity_ClientMasters`, `CalculateHoldingsPerAccount`, and `Cal_CB_Append_TxnUpload`
+ * 7. Queues `UpdatesSecurity_ClientMasters`, `CalculateHoldingMaster`, and `Cal_CB_Append_TxnUpload`
  *    (incremental cash passbook) on UpdateMasters. Full passbook rebuild: `Cal_CB_Per_TNX` (manual only).
  */
 export const uploadTempTransaction = async (req, res) => {
@@ -554,6 +606,7 @@ export const uploadTempTransaction = async (req, res) => {
 
     const uploadMs = Date.now();
     const objectKey = `transactions/TxnUpload-${uploadMs}-${file.name}`;
+    const originalObjectKey = `transactions-original/TxnUpload-${uploadMs}-${file.name}`;
     pipelineJobName = `TxnCsv_${uploadMs}`.slice(0, 48);
 
     const bucket = catalystApp.stratus().bucket(BUCKET_NAME);
@@ -563,9 +616,20 @@ export const uploadTempTransaction = async (req, res) => {
       overwrite: true,
       contentType: "text/csv",
     });
-
     passThrough.end(rewrittenCsv);
-    await uploadPromise;
+
+    const originalPassThrough = new PassThrough();
+    const originalUploadPromise = bucket.putObject(
+      originalObjectKey,
+      originalPassThrough,
+      {
+        overwrite: true,
+        contentType: "text/csv",
+      },
+    );
+    originalPassThrough.end(file.data);
+
+    await Promise.all([uploadPromise, originalUploadPromise]);
 
     /* ─── 3. Jobs row + bulk write → Transaction (poll to completion) ─ */
     zcqlForJob = catalystApp.zcql();
@@ -689,12 +753,27 @@ export const uploadTempTransaction = async (req, res) => {
     } else {
       const jobScheduling = catalystApp.jobScheduling();
 
+      /* Holdings: write the FULL pairs manifest to Stratus, then dispatch the
+       * master. The master fans out parallel worker jobs (CalculateHoldingWorkers),
+       * each processing a small slice — so neither the job-param size cap nor the
+       * 15-minute function timeout is a factor regardless of upload size. */
       try {
-        holdingsQueueJobName = `CHPA_${Date.now()}`.slice(0, 20);
+        const holdingsPairsKey = `transactions-meta/holdings-pairs-${uploadMs}.json`;
+        const holdingsPairsManifest = JSON.stringify(scopePairsResult.pairs);
+
+        const metaPassThrough = new PassThrough();
+        const metaUploadPromise = bucket.putObject(holdingsPairsKey, metaPassThrough, {
+          overwrite: true,
+          contentType: "application/json",
+        });
+        metaPassThrough.end(Buffer.from(holdingsPairsManifest, "utf8"));
+        await metaUploadPromise;
+
+        holdingsQueueJobName = `CHM_${Date.now()}`.slice(0, 20);
         await jobScheduling.JOB.submitJob({
           job_name: holdingsQueueJobName,
           jobpool_name: "UpdateMasters",
-          target_name: "CalculateHoldingsPerAccount",
+          target_name: "CalculateHoldingMaster",
           target_type: "Function",
           job_config: {
             number_of_retries: 5,
@@ -702,13 +781,15 @@ export const uploadTempTransaction = async (req, res) => {
           },
           params: {
             source: "TxnUpload",
-            pairsJson,
+            pairsObjectKey: holdingsPairsKey,
+            bucketName: BUCKET_NAME,
             importStartedAtMs: String(uploadMs),
           },
         });
       } catch (holdingsErr) {
+        holdingsJobSkipped = true;
         console.error(
-          "[TempTransactionUpload] Failed to queue CalculateHoldingsPerAccount:",
+          "[TempTransactionUpload] Failed to queue CalculateHoldingMaster:",
           holdingsErr,
         );
       }
@@ -794,7 +875,7 @@ export const uploadTempTransaction = async (req, res) => {
  * tracking table.
  */
 const STRATUS_TXN_KEY_PATTERN =
-  /^transactions\/Txn(?:Upload)?-(\d+)-(.+)$/;
+  /^transactions(?:-original)?\/Txn(?:Upload)?-(\d+)-(.+)$/;
 
 export function parseStratusTransactionUploadKey(key) {
   if (!key || typeof key !== "string") return null;
@@ -830,7 +911,7 @@ export const listUploadHistory = async (req, res) => {
     const bucket = catalystApp.stratus().bucket(BUCKET_NAME);
     const listOpts = {
       maxKeys: limit,
-      prefix: "transactions/",
+      prefix: "transactions-original/",
       orderBy: "desc",
     };
     if (cursor) listOpts.continuationToken = cursor;
@@ -909,7 +990,7 @@ export const downloadUploadHistory = async (req, res) => {
     }
 
     const key = String(req.query.key || "").trim();
-    if (!key.startsWith("transactions/")) {
+    if (!key.startsWith("transactions-original/")) {
       return res
         .status(400)
         .json({ success: false, message: "Invalid object key" });
