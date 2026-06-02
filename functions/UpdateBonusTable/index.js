@@ -237,7 +237,8 @@ module.exports = async (jobRequest, context) => {
     }
 
     /* ======================================================
-       STEP 2: FETCH TX / BONUS / SPLIT (ROWID dedupe — matches preview API)
+
+    STEP 2: FETCH TX / BONUS / SPLIT (ROWID dedupe — matches preview API)
        ====================================================== */
     const fetchAllDeduped = async (table, dateCol, operator, orderBySql) => {
       const out = [];
