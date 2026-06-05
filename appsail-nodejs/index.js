@@ -17,6 +17,8 @@ import DividendUploaderRouter from "./router/uploaderRouter/DividendUploaderRout
 import IsinRouter from "./router/IsinRouter.js";
 import DemergerRouter from "./router/DemergerRouter.js";
 import MergerRouter from "./router/MergerRouter.js";
+import ClientRouter from "./router/clientRouter/ClientRouter.js";
+import SecurityRouter from "./router/securityRouter/SecurityRouter.js";
 
 app.use(
   cors({
@@ -26,7 +28,6 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
 );
-
 app.use(Express.json());
 app.use(Express.urlencoded({ extended: true }));
 
@@ -64,6 +65,8 @@ app.use("/api/dividend", DividendUploaderRouter);
 app.use("/api/isin", IsinRouter);
 app.use("/api/demerger", DemergerRouter);
 app.use("/api/merger", MergerRouter);
+app.use("/api/client", ClientRouter);
+app.use("/api/security", SecurityRouter);
 
 app.put("/update", async (req, res) => {
   console.log("Update started");

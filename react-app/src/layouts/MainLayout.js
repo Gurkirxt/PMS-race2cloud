@@ -47,6 +47,12 @@ function MainLayout({ title, rightContent, children }) {
     if (location.pathname === "/reports") {
       return "reports";
     }
+    if (location.pathname === "/master-client") {
+      return "master-client";
+    }
+    if (location.pathname === "/master-security") {
+      return "master-security";
+    }
 
     return "dashboard";
   };
@@ -69,6 +75,12 @@ function MainLayout({ title, rightContent, children }) {
     { key: "updateISIN", label: "Update ISIN" },
     { key: "cash-balance", label: "Cash Balance" },
     { key: "reports", label: "Reports" },
+    {
+      key: "master", label: "Master", children: [
+        { key: "master-client", label: "Client" },
+        { key: "master-security", label: "Security" },
+      ]
+    },
   ];
 
   const contentStyle = {

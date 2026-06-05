@@ -513,21 +513,25 @@ export function Sidebar({ items = [], activeKey }) {
   const corporateActionPaths = ["/split", "/bonus", "/dividend", "/demerger", "/merger"];
   const isOnCorporateActionChild = corporateActionPaths.includes(location.pathname);
 
+  // Keep any parent dropdown (Corporate Actions, Master, ...) open when on one of its child routes
   useEffect(() => {
-    if (isOnCorporateActionChild) {
-      setOpenKey("corporate-actions");
+    const currentKey =
+      location.pathname === "/" ? "dashboard" : location.pathname.replace(/^\//, "");
+    const parent = items.find(
+      (it) => it.children && it.children.some((c) => c.key === currentKey)
+    );
+    if (parent) {
+      setOpenKey(parent.key);
     }
-  }, [location.pathname, isOnCorporateActionChild]);
+  }, [location.pathname, items]);
 
   const sidebarStyle = {
     width: 240,
+    flexShrink: 0,
     background: "#8b1538", // Changed to dark pink/maroon (solid color instead of gradient)
     color: "#ffffff",
     minHeight: "100vh",
     boxSizing: "border-box",
-    position: "fixed",
-    left: 0,
-    top: 0,
     display: "flex",
     flexDirection: "column",
     boxShadow: "4px 0 20px rgba(0, 0, 0, 0.1)",
@@ -684,7 +688,6 @@ export function PageLayout({ sidebar, children }) {
     width: "100%",
     maxWidth: "100%",
     boxSizing: "border-box",
-    marginLeft: 240, // Account for fixed sidebar width
   };
 
   return (
