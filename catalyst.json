@@ -34,7 +34,8 @@
       "DemergerFn",
       "RebuildHoldingtable",
       "CalculateHoldingWorkers",
-      "CalculateHoldingMaster"
+      "CalculateHoldingMaster",
+      "HoldingUpdateManually"
     ],
     "ignore": [],
     "source": "functions"
