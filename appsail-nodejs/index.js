@@ -85,8 +85,31 @@ AND executionPriority IS NULL
   res.status(200).json({ message: "Update successful" });
 });
 
+// Fill each row with account codes. One job is triggered per row, 10 at a time.
+const accounts = [
+  [""],
+  [""],
+];
+
+app.post("/trigger-holding-update", async (req, res) => {
+  const scheduling = req.catalystApp.jobScheduling();
+  const ts = Date.now();
+
+  for (let i = 0; i < accounts.length; i++) {
+    await scheduling.JOB.submitJob({
+      job_name: `HUM_${ts}_${i}`.slice(0, 50),
+      jobpool_name: "Export",
+      target_name: "HoldingUpdateManually",
+      target_type: "Function",
+      job_config: { number_of_retries: 3, retry_interval: 60 * 1000 },
+      params: { accountCodesJson: JSON.stringify(accounts[i]) },
+    });
+  }
+
+  return res.json({ success: true, jobsDispatched: accounts.length });
+});
+
 app.listen(port, () => {
   console.log(`Example app listening on port ${port}`);
   console.log(`http://localhost:${port}/`);
 });
-
