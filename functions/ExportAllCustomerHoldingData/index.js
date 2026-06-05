@@ -18,6 +18,10 @@ module.exports = async (jobRequest, context) => {
     const { asOnDate, fileName } = jobDetails;
     jobName = jobDetails.jobName;
 
+    // Report date stamped on every row. exportAllData always passes a concrete
+    // asOnDate, but default to today defensively.
+    const reportDate = asOnDate || new Date().toISOString().split("T")[0];
+
     const stratus = catalystApp.stratus();
     const bucket = stratus.bucket("upload-data-bucket");
 
@@ -42,7 +46,7 @@ module.exports = async (jobRequest, context) => {
     /* ---------------- BUILD CSV IN MEMORY ---------------- */
     const csvLines = [];
     csvLines.push(
-      "ACCOUNT_CODE,SECURITY_NAME,SECURITY_CODE,ISIN,HOLDING,WAP,HOLDING_VALUE,LAST_PRICE,MARKET_VALUE\n"
+      "AS_ON_DATE,ACCOUNT_CODE,SECURITY_NAME,SECURITY_CODE,ISIN,HOLDING,WAP,HOLDING_VALUE,LAST_PRICE,MARKET_VALUE\n"
     );
 
     let count = 0;
@@ -71,6 +75,7 @@ module.exports = async (jobRequest, context) => {
 
         for (const row of rows) {
           const line = [
+            reportDate,
             accountCode,
             row.stockName ?? "",
             row.securityCode ?? "",
