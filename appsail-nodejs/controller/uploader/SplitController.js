@@ -1,4 +1,4 @@
-import { runFifoEngine } from "../../util/analytics/transactionHistory/fifo.js";
+const HOLDINGS_BATCH = 250;
 
 export const getAllSecuritiesISINs = async (req, res) => {
   try {
@@ -82,169 +82,87 @@ export const previewStockSplit = async (req, res) => {
     issueDateObj.setHours(0, 0, 0, 0);
     const issueDateISO = issueDateObj.toISOString().split("T")[0];
 
+    // cutoff = day AFTER issueDate for the date filter
+    const cutoffObj = new Date(issueDateISO);
+    cutoffObj.setDate(cutoffObj.getDate() + 1);
+    const cutoff = cutoffObj.toISOString().split("T")[0];
+
     const zcql = req.catalystApp.zcql();
 
     /* ======================================================
-       STEP 1: FIND ACCOUNTS WITH TRANSACTIONS FOR THIS ISIN
+       STEP 1: READ Holdings AS OF issueDate
+       Fetch all Holdings rows for this ISIN with date filter.
+       Walk in FIFO order (CREATEDTIME ASC, ROWID ASC) and keep
+       updating per account — last row per account = state on issueDate.
        ====================================================== */
-    const accountSet = new Set();
-    let holdOffset = 0;
+    const latestByAccount = new Map(); // accountCode → last Holdings row
+    let offset = 0;
 
     while (true) {
       const batch = await zcql.executeZCQLQuery(`
-        SELECT WS_Account_code
-        FROM Transaction
-        WHERE ISIN='${isin}'
-        LIMIT ${ZCQL_ROW_LIMIT} OFFSET ${holdOffset}
+        SELECT WS_Account_code, HOLDING, WAP, HOLDING_VALUE,
+               SETTLEMENT_DATE, TRANSACTION_DATE
+        FROM Holdings
+        WHERE ISIN = '${isin}'
+          AND (SETTLEMENT_DATE < '${cutoff}' OR TRANSACTION_DATE < '${cutoff}')
+        ORDER BY CREATEDTIME ASC, ROWID ASC
+        LIMIT ${HOLDINGS_BATCH} OFFSET ${offset}
       `);
 
       if (!batch || batch.length === 0) break;
-      batch.forEach((r) => accountSet.add(r.Transaction.WS_Account_code));
-      if (batch.length < ZCQL_ROW_LIMIT) break;
-      holdOffset += ZCQL_ROW_LIMIT;
+
+      for (const row of batch) {
+        const h = row.Holdings || row;
+        const acc = String(h.WS_Account_code || "").trim();
+        if (!acc) continue;
+        latestByAccount.set(acc, h); // last row per account wins
+      }
+
+      if (batch.length < HOLDINGS_BATCH) break;
+      offset += HOLDINGS_BATCH;
     }
 
-    const eligibleAccounts = Array.from(accountSet);
-
-    if (!eligibleAccounts.length) {
+    if (latestByAccount.size === 0) {
       return res.json({ success: true, data: [] });
     }
 
     /* ======================================================
-       STEP 2: FETCH TRANSACTIONS (<= ISSUE DATE)
-       ====================================================== */
-    const txRows = [];
-    const seenTxnRowIds = new Set();
-    let txOffset = 0;
+       STEP 2: CALCULATE SPLIT PREVIEW (simple arithmetic)
+       Holdings table already has HOLDING, WAP, HOLDING_VALUE
+       computed by FIFO. No need to re-run FIFO engine.
 
-    while (true) {
-      const batch = await zcql.executeZCQLQuery(`
-        SELECT *
-        FROM Transaction
-        WHERE ISIN='${isin}'
-        AND SETDATE <= '${issueDateISO}'
-        ORDER BY SETDATE ASC, ROWID ASC
-        LIMIT ${ZCQL_ROW_LIMIT} OFFSET ${txOffset}
-      `);
-
-      if (!batch || batch.length === 0) break;
-      for (const row of batch) {
-        const t = row.Transaction || row;
-        const rowId = t.ROWID;
-        if (rowId != null && seenTxnRowIds.has(rowId)) continue;
-        if (rowId != null) seenTxnRowIds.add(rowId);
-        txRows.push(row);
-      }
-      if (batch.length < ZCQL_ROW_LIMIT) break;
-      txOffset += ZCQL_ROW_LIMIT;
-    }
-
-    /* ======================================================
-       STEP 3: FETCH BONUSES (<= ISSUE DATE)
-       ====================================================== */
-    const bonusRows = [];
-    const seenBonusRowIds = new Set();
-    let bonusOffset = 0;
-
-    while (true) {
-      const batch = await zcql.executeZCQLQuery(`
-        SELECT *
-        FROM Bonus
-        WHERE ISIN='${isin}'
-        AND ExDate <= '${issueDateISO}'
-        ORDER BY ExDate ASC, ROWID ASC
-        LIMIT ${ZCQL_ROW_LIMIT} OFFSET ${bonusOffset}
-      `);
-
-      if (!batch || batch.length === 0) break;
-      for (const row of batch) {
-        const b = row.Bonus || row;
-        const rowId = b.ROWID;
-        if (rowId != null && seenBonusRowIds.has(rowId)) continue;
-        if (rowId != null) seenBonusRowIds.add(rowId);
-        bonusRows.push(row);
-      }
-      if (batch.length < ZCQL_ROW_LIMIT) break;
-      bonusOffset += ZCQL_ROW_LIMIT;
-    }
-
-    /* ======================================================
-       STEP 4: FETCH PAST SPLITS (<= ISSUE DATE)
-       ====================================================== */
-    const splitRows = [];
-    const seenSplitRowIds = new Set();
-    let splitOffset = 0;
-
-    while (true) {
-      const batch = await zcql.executeZCQLQuery(`
-        SELECT *
-        FROM Split
-        WHERE ISIN='${isin}'
-        AND Issue_Date <= '${issueDateISO}'
-        ORDER BY Issue_Date ASC, ROWID ASC
-        LIMIT ${ZCQL_ROW_LIMIT} OFFSET ${splitOffset}
-      `);
-
-      if (!batch || batch.length === 0) break;
-      for (const row of batch) {
-        const s = row.Split || row;
-        const rowId = s.ROWID;
-        if (rowId != null && seenSplitRowIds.has(rowId)) continue;
-        if (rowId != null) seenSplitRowIds.add(rowId);
-        splitRows.push(row);
-      }
-      if (batch.length < ZCQL_ROW_LIMIT) break;
-      splitOffset += ZCQL_ROW_LIMIT;
-    }
-
-    /* ======================================================
-       STEP 5: GROUP DATA BY ACCOUNT
-       ====================================================== */
-    const txByAccount = {};
-    txRows.forEach((r) => {
-      const t = r.Transaction;
-      (txByAccount[t.WS_Account_code] ||= []).push(t);
-    });
-
-    const bonusByAccount = {};
-    bonusRows.forEach((r) => {
-      const b = r.Bonus;
-      (bonusByAccount[b.WS_Account_code] ||= []).push(b);
-    });
-
-    const pastSplits = splitRows.map((r) => {
-      const s = r.Split;
-      return {
-        issueDate: s.Issue_Date,
-        ratio1: Number(s.Ratio1) || 0,
-        ratio2: Number(s.Ratio2) || 0,
-        isin: s.ISIN,
-      };
-    });
-
-    /* ======================================================
-       STEP 6: FIFO PREVIEW
+       Split logic:
+         newHolding      = floor(currentHolding × ratio2 / ratio1)
+         holdingValue    = unchanged (same total cost)
+         newWAP          = holdingValue / newHolding (price per share halves)
        ====================================================== */
     const preview = [];
     const splitMultiplier = r2 / r1;
 
-    for (const accountCode of eligibleAccounts) {
-      const transactions = txByAccount[accountCode] || [];
-      if (!transactions.length) continue;
+    for (const [accountCode, h] of latestByAccount) {
+      const currentHolding = Number(h.HOLDING) || 0;
+      if (currentHolding <= 0) continue; // fully sold before issueDate
 
-      const bonuses = bonusByAccount[accountCode] || [];
+      const holdingValue = Number(h.HOLDING_VALUE) || 0;
+      const currentWAP   = Number(h.WAP) || 0;
 
-      const before = runFifoEngine(transactions, bonuses, pastSplits, true);
-      if (!before || before.holdings <= 0) continue;
+      const newHolding = Math.floor(currentHolding * splitMultiplier);
+      if (newHolding <= 0) continue;
 
-      const newHolding = Math.floor(before.holdings * splitMultiplier);
+      // Cost is unchanged — more shares at same total cost → WAP goes down
+      const newWAP = newHolding > 0
+        ? Math.round((holdingValue / newHolding) * 100) / 100
+        : 0;
 
       preview.push({
         isin,
         accountCode,
-        currentHolding: before.holdings,
+        currentHolding,
+        currentWAP,
+        holdingValue,
         newHolding,
-        delta: newHolding - before.holdings,
+        newWAP,
+        delta: newHolding - currentHolding,
       });
     }
 

@@ -1,7 +1,7 @@
 import Express from "express";
 const app = Express();
 const port = process.env.X_ZOHO_CATALYST_LISTEN_PORT || 9000;
-//import cors from "cors";
+import cors from "cors";
 
 import AnalyticsRouter from "./router/AnalyticsRouter.js";
 import TransactionsRouter from "./router/TransactionRouter.js";
@@ -10,7 +10,6 @@ import SplitRouter from "./router/SplitRouter.js";
 import ExportRouter from "./router/export/ExportRouter.js";
 import catalyst from "zcatalyst-sdk-node";
 import BhavUploaderRouter from "./router/uploaderRouter/BhavUploaderRouter.js";
-import TransactionUploaderRouter from "./router/uploaderRouter/TransactionUploaderRouter.js";
 import TempTransactionUploaderRouter from "./router/uploaderRouter/TempTransactionUploaderRouter.js";
 import CashBalanceRouter from "./router/cashBalanceRouter/CashbalanceRouter.js";
 import BonusRouter from "./router/BonusRouter.js";
@@ -18,7 +17,7 @@ import DividendUploaderRouter from "./router/uploaderRouter/DividendUploaderRout
 import IsinRouter from "./router/IsinRouter.js";
 import DemergerRouter from "./router/DemergerRouter.js";
 import MergerRouter from "./router/MergerRouter.js";
-/**
+
 app.use(
   cors({
     origin: "http://localhost:3000",
@@ -26,7 +25,8 @@ app.use(
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
-);**/
+);
+
 app.use(Express.json());
 app.use(Express.urlencoded({ extended: true }));
 
@@ -57,7 +57,6 @@ app.use("/api/dashboard", DashboardRouter);
 app.use("/api/split", SplitRouter);
 app.use("/api/export", ExportRouter);
 app.use("/api/bhav", BhavUploaderRouter);
-app.use("/api/transaction-uploader", TransactionUploaderRouter);
 app.use("/api/transaction-uploader", TempTransactionUploaderRouter);
 app.use("/api/cash-balance", CashBalanceRouter);
 app.use("/api/bonus", BonusRouter);
@@ -81,9 +80,10 @@ AND executionPriority IS NULL
     console.log(count);
   }
   res.status(200).json({ message: "Update successful" });
-})
+});
 
 app.listen(port, () => {
   console.log(`Example app listening on port ${port}`);
   console.log(`http://localhost:${port}/`);
 });
+
