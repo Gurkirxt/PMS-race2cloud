@@ -12,6 +12,10 @@ export const exportDataPerAccount = async (req, res) => {
       });
     }
 
+    // Report date stamped on every row. Blank As On Date → today (matches the
+    // pricing fallback in calculateHoldingsSummary).
+    const reportDate = asOnDate || new Date().toISOString().split("T")[0];
+
     /* ---------------- INIT ---------------- */
     const catalystApp = req.catalystApp;
     const stratus = catalystApp.stratus();
@@ -29,7 +33,7 @@ export const exportDataPerAccount = async (req, res) => {
 
     /* ---------------- CSV HEADER ---------------- */
     csvStream.write(
-      "ACCOUNT_CODE,SECURITY_NAME,SECURITY_CODE,ISIN,HOLDING,WAP,HOLDING_VALUE,LAST_PRICE,MARKET_VALUE\n"
+      "AS_ON_DATE,ACCOUNT_CODE,SECURITY_NAME,SECURITY_CODE,ISIN,HOLDING,WAP,HOLDING_VALUE,LAST_PRICE,MARKET_VALUE\n"
     );
 
     /* ---------------- FETCH DATA (SINGLE CLIENT) ---------------- */
@@ -53,6 +57,7 @@ export const exportDataPerAccount = async (req, res) => {
     /* ---------------- WRITE CSV ROWS ---------------- */
     for (const row of rows) {
       const line = [
+        reportDate,
         accountCode,
         row.stockName ?? "",
         row.securityCode ?? "",
