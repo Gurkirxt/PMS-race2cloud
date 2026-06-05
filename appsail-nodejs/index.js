@@ -10,7 +10,6 @@ import SplitRouter from "./router/SplitRouter.js";
 import ExportRouter from "./router/export/ExportRouter.js";
 import catalyst from "zcatalyst-sdk-node";
 import BhavUploaderRouter from "./router/uploaderRouter/BhavUploaderRouter.js";
-import TransactionUploaderRouter from "./router/uploaderRouter/TransactionUploaderRouter.js";
 import TempTransactionUploaderRouter from "./router/uploaderRouter/TempTransactionUploaderRouter.js";
 import CashBalanceRouter from "./router/cashBalanceRouter/CashbalanceRouter.js";
 import BonusRouter from "./router/BonusRouter.js";
@@ -59,7 +58,6 @@ app.use("/api/dashboard", DashboardRouter);
 app.use("/api/split", SplitRouter);
 app.use("/api/export", ExportRouter);
 app.use("/api/bhav", BhavUploaderRouter);
-app.use("/api/transaction-uploader", TransactionUploaderRouter);
 app.use("/api/transaction-uploader", TempTransactionUploaderRouter);
 app.use("/api/cash-balance", CashBalanceRouter);
 app.use("/api/bonus", BonusRouter);
@@ -85,9 +83,10 @@ AND executionPriority IS NULL
     console.log(count);
   }
   res.status(200).json({ message: "Update successful" });
-})
+});
 
 app.listen(port, () => {
   console.log(`Example app listening on port ${port}`);
   console.log(`http://localhost:${port}/`);
 });
+

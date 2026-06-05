@@ -6,16 +6,28 @@ import { stratusSignedUrlToString } from "../../util/stratusSignedUrl.js";
 const BUCKET_NAME = "client-transaction-files";
 const TABLE_NAME = "Transaction";
 
-/** Poll Catalyst Datastore bulk write (same pattern as `functions/MegerFn/index.js`). */
-const BULK_POLL_INTERVAL_MS = 3000;
-const BULK_POLL_MAX_WAIT_MS = 45 * 60 * 1000;
+/** AppSail public base URL — used as the bulk-write callback target. */
+const APPSAIL_BASE_URL =
+  process.env.CATALYST_APPSAIL_URL ||
+  "https://backend-50039746698.development.catalystappsail.in";
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-function sleep(ms) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
+/** Read a Stratus object fully into a UTF-8 string. */
+async function readStratusObjectAsString(bucket, objectKey) {
+  const raw = await bucket.getObject(objectKey);
+  if (raw == null) return "";
+  if (typeof raw === "string") return raw;
+  if (Buffer.isBuffer(raw)) return raw.toString("utf8");
+  if (raw instanceof ArrayBuffer) return Buffer.from(raw).toString("utf8");
+  if (typeof raw === "object" && typeof raw.pipe === "function") {
+    const chunks = [];
+    for await (const chunk of raw) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks).toString("utf8");
+  }
+  return "";
 }
 
 function escSql(s) {
@@ -52,29 +64,6 @@ async function updateJobsStatus(zcql, jobName, status) {
       e.message,
     );
   }
-}
-
-async function pollTransactionBulkWriteJob(bulkWrite, jobId) {
-  const start = Date.now();
-  while (Date.now() - start < BULK_POLL_MAX_WAIT_MS) {
-    await sleep(BULK_POLL_INTERVAL_MS);
-    try {
-      const res = await bulkWrite.getStatus(jobId);
-      const st = String(res?.status || "").toUpperCase();
-      if (st === "COMPLETED") return res;
-      if (st === "FAILED") {
-        throw new Error(
-          `Bulk write job ${jobId} failed: ${JSON.stringify(res)}`,
-        );
-      }
-    } catch (err) {
-      if (String(err?.message || "").includes("failed")) throw err;
-      console.error(`[TempTransactionUpload] poll bulk ${jobId}:`, err);
-    }
-  }
-  throw new Error(
-    `Bulk write job ${jobId} timed out after ${BULK_POLL_MAX_WAIT_MS}ms`,
-  );
 }
 
 /**
@@ -193,9 +182,12 @@ function detectSeparator(firstLine) {
 }
 
 function splitHeaderCells(firstLine, separator) {
-  return firstLine
-    .split(separator)
-    .map((c) => c.trim().replace(/^\uFEFF/, "").trim());
+  return firstLine.split(separator).map((c) =>
+    c
+      .trim()
+      .replace(/^\uFEFF/, "")
+      .trim(),
+  );
 }
 
 /**
@@ -251,9 +243,7 @@ function isValidYyyyMmDd(value) {
   const [y, m, d] = s.split("-").map(Number);
   const dt = new Date(s + "T00:00:00");
   return (
-    dt.getFullYear() === y &&
-    dt.getMonth() + 1 === m &&
-    dt.getDate() === d
+    dt.getFullYear() === y && dt.getMonth() + 1 === m && dt.getDate() === d
   );
 }
 
@@ -483,11 +473,11 @@ function extractDistinctBrokerAccountIsinPairsFromCsv(fileBuffer) {
  * 2. Validates the CSV parses and has at least one data row.
  * 3. Validates date columns on the first 3 data rows (blank / 0 / null allowed when empty).
  * 4. Rewrites CSV: maps template headers to Transaction columns (HEADER_MAP), tab → comma, trim cells.
- * 5. Uploads rewritten CSV to Stratus bucket client-transaction-files under transactions/.
- * 6. Inserts `Jobs` (RUNNING), runs Datastore bulk write → `Transaction`, polls to completion,
- *    then sets `Jobs` to COMPLETED (or FAILED). `jobName` is `TxnCsv_<ms>` matching `TxnUpload-<ms>-` in objectKey.
- * 7. Queues `UpdatesSecurity_ClientMasters`, `CalculateHoldingMaster`, and `Cal_CB_Append_TxnUpload`
- *    (incremental cash passbook) on UpdateMasters. Full passbook rebuild: `Cal_CB_Per_TNX` (manual only).
+ * 5. Uploads rewritten CSV + original CSV to Stratus. Writes pairs JSON + account codes JSON to Stratus.
+ * 6. Creates Datastore bulk write job (Transaction table) WITH a callback URL.
+ *    Catalyst calls /bulk-callback when the job completes — no polling, returns immediately.
+ * 7. /bulk-callback handler queues UpdatesSecurity_ClientMasters, CalculateHoldingMaster,
+ *    and Cal_CB_Append_TxnUpload once bulk write is confirmed complete.
  */
 export const uploadTempTransaction = async (req, res) => {
   let pipelineJobName = null;
@@ -534,7 +524,7 @@ export const uploadTempTransaction = async (req, res) => {
     } catch (parseErr) {
       console.error(
         `[TempTransactionUpload] CSV parse error [${new Date().toISOString()}]:`,
-        parseErr
+        parseErr,
       );
       return res.status(400).json({
         success: false,
@@ -631,12 +621,53 @@ export const uploadTempTransaction = async (req, res) => {
 
     await Promise.all([uploadPromise, originalUploadPromise]);
 
-    /* ─── 3. Jobs row + bulk write → Transaction (poll to completion) ─ */
+    /* ─── 3. Write pairs manifest + account codes to Stratus ────────── */
+    const hasPairs = scopePairsResult.pairs.length > 0;
+
+    const holdingsPairsKey = `transactions-meta/holdings-pairs-${uploadMs}.json`;
+    const accountCodesKey = `transactions-meta/account-codes-${uploadMs}.json`;
+
+    if (hasPairs) {
+      const accountCodesForCash = [
+        ...new Set(
+          scopePairsResult.pairs
+            .map(([acc]) => String(acc ?? "").trim())
+            .filter(Boolean),
+        ),
+      ].sort((a, b) => a.localeCompare(b));
+
+      const pairsMeta = new PassThrough();
+      const pairsUpload = bucket.putObject(holdingsPairsKey, pairsMeta, {
+        overwrite: true,
+        contentType: "application/json",
+      });
+      pairsMeta.end(
+        Buffer.from(JSON.stringify(scopePairsResult.pairs), "utf8"),
+      );
+      await pairsUpload;
+
+      const codesMeta = new PassThrough();
+      const codesUpload = bucket.putObject(accountCodesKey, codesMeta, {
+        overwrite: true,
+        contentType: "application/json",
+      });
+      codesMeta.end(Buffer.from(JSON.stringify(accountCodesForCash), "utf8"));
+      await codesUpload;
+
+      console.log(
+        `[TempTransactionUpload] Wrote ${scopePairsResult.pairs.length} pairs and ` +
+          `${accountCodesForCash.length} account codes to Stratus.`,
+      );
+    }
+
+    /* ─── 4. Mark job RUNNING + create bulk write job WITH callback ── */
     zcqlForJob = catalystApp.zcql();
     await ensureJobsRow(zcqlForJob, pipelineJobName, "RUNNING");
 
     const datastore = catalystApp.datastore();
     const bulkWrite = datastore.table(TABLE_NAME).bulkJob("write");
+
+    const callbackUrl = `${APPSAIL_BASE_URL}/api/transaction-uploader/bulk-callback`;
 
     let bulkJob;
     try {
@@ -647,6 +678,18 @@ export const uploadTempTransaction = async (req, res) => {
         },
         {
           operation: "insert",
+          callback: {
+            url: callbackUrl,
+            params: {
+              pipelineJobName,
+              holdingsPairsKey,
+              accountCodesKey,
+              bucketName: BUCKET_NAME,
+              importStartedAtMs: String(uploadMs),
+              objectKey,
+              hasPairs: String(hasPairs),
+            },
+          },
         },
       );
     } catch (bulkCreateErr) {
@@ -654,203 +697,31 @@ export const uploadTempTransaction = async (req, res) => {
       throw bulkCreateErr;
     }
 
-    try {
-      await pollTransactionBulkWriteJob(bulkWrite, bulkJob.job_id);
-    } catch (pollErr) {
-      await updateJobsStatus(zcqlForJob, pipelineJobName, "FAILED");
-      throw pollErr;
-    }
+    console.log(
+      `[TempTransactionUpload] Bulk write job created: ${bulkJob.job_id}. ` +
+        `Callback registered at ${callbackUrl}`,
+    );
 
-    await updateJobsStatus(zcqlForJob, pipelineJobName, "COMPLETED");
-
-    /* Masters sync (clientIds / Security_List) from uploaded CSV on Stratus. */
-    let mastersQueueJobName = null;
-    let mastersJobSkipped = false;
-
-    try {
-      const jobSchedulingForMasters = catalystApp.jobScheduling();
-      mastersQueueJobName = `USCM_${Date.now()}`.slice(0, 20);
-      await jobSchedulingForMasters.JOB.submitJob({
-        job_name: mastersQueueJobName,
-        jobpool_name: "UpdateMasters",
-        target_name: "UpdatesSecurity_ClientMasters",
-        target_type: "Function",
-        job_config: {
-          number_of_retries: 5,
-          retry_interval: 60 * 1000,
-        },
-        params: {
-          source: "TxnUpload",
-          bucketName: BUCKET_NAME,
-          objectKey,
-        },
-      });
-    } catch (mastersErr) {
-      mastersJobSkipped = true;
-      console.error(
-        "[TempTransactionUpload] Failed to queue UpdatesSecurity_ClientMasters:",
-        mastersErr,
-      );
-    }
-
-    /* Serialize distinct pairs for scoped Holdings job (Catalyst param size cap). */
-    let pairsForJob = scopePairsResult.pairs;
-    let holdingsPairsJsonTruncated = false;
-    let pairsJson = JSON.stringify(pairsForJob);
-    if (pairsJson.length > MAX_PAIRS_JSON_CHARS) {
-      holdingsPairsJsonTruncated = true;
-      while (
-        pairsForJob.length > 1 &&
-        JSON.stringify(pairsForJob).length > MAX_PAIRS_JSON_CHARS
-      ) {
-        pairsForJob = pairsForJob.slice(
-          0,
-          Math.max(1, Math.floor(pairsForJob.length * 0.85)),
-        );
-      }
-      pairsJson = JSON.stringify(pairsForJob);
-      console.warn(
-        `[TempTransactionUpload] pairsJson trimmed to ${pairsForJob.length} pair(s) (param size cap ${MAX_PAIRS_JSON_CHARS})`,
-      );
-    }
-
-    const accountCodesForCash = [
-      ...new Set(pairsForJob.map(([acc]) => String(acc ?? "").trim()).filter(Boolean)),
-    ].sort((a, b) => a.localeCompare(b));
-
-    let accountCodesJson = JSON.stringify(accountCodesForCash);
-    let cashAccountCodesJsonTruncated = false;
-    if (accountCodesJson.length > MAX_PAIRS_JSON_CHARS) {
-      cashAccountCodesJsonTruncated = true;
-      let trimmed = accountCodesForCash;
-      while (
-        trimmed.length > 1 &&
-        JSON.stringify(trimmed).length > MAX_PAIRS_JSON_CHARS
-      ) {
-        trimmed = trimmed.slice(
-          0,
-          Math.max(1, Math.floor(trimmed.length * 0.85)),
-        );
-      }
-      accountCodesJson = JSON.stringify(trimmed);
-      console.warn(
-        `[TempTransactionUpload] accountCodesJson trimmed to ${trimmed.length} account(s) (param size cap ${MAX_PAIRS_JSON_CHARS})`,
-      );
-    }
-
-    /* Holdings + incremental cash passbook: queue on UpdateMasters when CSV has pairs. */
-    let holdingsQueueJobName = null;
-    let holdingsJobSkipped = false;
-    let cashPassbookQueueJobName = null;
-    let cashPassbookJobSkipped = false;
-
-    if (pairsForJob.length === 0) {
-      holdingsJobSkipped = true;
-      cashPassbookJobSkipped = true;
-      console.warn(
-        "[TempTransactionUpload] No BROKERACID/SYMBOLCODE pairs in CSV — skipping Holdings and Cal_CB_Append_TxnUpload jobs.",
-      );
-    } else {
-      const jobScheduling = catalystApp.jobScheduling();
-
-      /* Holdings: write the FULL pairs manifest to Stratus, then dispatch the
-       * master. The master fans out parallel worker jobs (CalculateHoldingWorkers),
-       * each processing a small slice — so neither the job-param size cap nor the
-       * 15-minute function timeout is a factor regardless of upload size. */
-      try {
-        const holdingsPairsKey = `transactions-meta/holdings-pairs-${uploadMs}.json`;
-        const holdingsPairsManifest = JSON.stringify(scopePairsResult.pairs);
-
-        const metaPassThrough = new PassThrough();
-        const metaUploadPromise = bucket.putObject(holdingsPairsKey, metaPassThrough, {
-          overwrite: true,
-          contentType: "application/json",
-        });
-        metaPassThrough.end(Buffer.from(holdingsPairsManifest, "utf8"));
-        await metaUploadPromise;
-
-        holdingsQueueJobName = `CHM_${Date.now()}`.slice(0, 20);
-        await jobScheduling.JOB.submitJob({
-          job_name: holdingsQueueJobName,
-          jobpool_name: "UpdateMasters",
-          target_name: "CalculateHoldingMaster",
-          target_type: "Function",
-          job_config: {
-            number_of_retries: 5,
-            retry_interval: 60 * 1000,
-          },
-          params: {
-            source: "TxnUpload",
-            pairsObjectKey: holdingsPairsKey,
-            bucketName: BUCKET_NAME,
-            importStartedAtMs: String(uploadMs),
-          },
-        });
-      } catch (holdingsErr) {
-        holdingsJobSkipped = true;
-        console.error(
-          "[TempTransactionUpload] Failed to queue CalculateHoldingMaster:",
-          holdingsErr,
-        );
-      }
-
-      try {
-        cashPassbookQueueJobName = `CCB_${Date.now()}`.slice(0, 20);
-        await jobScheduling.JOB.submitJob({
-          job_name: cashPassbookQueueJobName,
-          jobpool_name: "UpdateMasters",
-          target_name: "Cal_CB_Append_TxnUpload",
-          target_type: "Function",
-          job_config: {
-            number_of_retries: 5,
-            retry_interval: 60 * 1000,
-          },
-          params: {
-            source: "TxnUpload",
-            accountCodesJson,
-            importStartedAtMs: String(uploadMs),
-          },
-        });
-      } catch (cashErr) {
-        cashPassbookJobSkipped = true;
-        console.error(
-          "[TempTransactionUpload] Failed to queue Cal_CB_Append_TxnUpload:",
-          cashErr,
-        );
-      }
-    }
-
-    const jobsQueued =
-      !mastersJobSkipped || !holdingsJobSkipped || !cashPassbookJobSkipped;
-    const jobsMessage = !jobsQueued
-      ? "Transaction bulk import finished and Jobs is COMPLETED. Follow-up jobs were not queued."
-      : "Transaction bulk import finished and Jobs is COMPLETED. Masters, holdings, and/or incremental cash passbook jobs were queued as applicable.";
-
-    /* ─── 4. RESPOND ──────────────────────────────────────────────── */
+    /* ─── 5. RESPOND IMMEDIATELY ─────────────────────────────────── */
     return res.status(200).json({
       success: true,
-      message: jobsMessage,
+      message:
+        "File uploaded successfully. Transaction import is running in the background. " +
+        "Holdings and cash balance will be updated automatically once import completes.",
       pipelineJobName,
-      mastersQueueJobName,
-      mastersJobSkipped,
-      holdingsQueueJobName,
-      holdingsJobSkipped,
-      holdingsDistinctPairs: pairsForJob.length,
-      holdingsPairsTruncated: scopePairsResult.truncated,
-      holdingsPairsJsonTruncated,
-      cashPassbookQueueJobName,
-      cashPassbookJobSkipped,
-      cashPassbookDistinctAccounts: accountCodesForCash.length,
-      cashAccountCodesJsonTruncated,
+      bulkJobId: bulkJob.job_id,
       fileName: file.name,
       objectKey,
       bucket: BUCKET_NAME,
       table: TABLE_NAME,
-      bulkJobId: bulkJob.job_id,
-      bulkJobStatus: "COMPLETED",
+      holdingsPairsCount: scopePairsResult.pairs.length,
+      status: "PROCESSING",
     });
   } catch (error) {
-    console.error(`[TempTransactionUpload] [Error] [${new Date().toISOString()}] :`, error);
+    console.error(
+      `[TempTransactionUpload] [Error] [${new Date().toISOString()}] :`,
+      error,
+    );
 
     if (pipelineJobName && zcqlForJob) {
       await updateJobsStatus(zcqlForJob, pipelineJobName, "FAILED");
@@ -862,6 +733,156 @@ export const uploadTempTransaction = async (req, res) => {
       error: error.message,
       ...(pipelineJobName ? { pipelineJobName } : {}),
     });
+  }
+};
+
+/* ──────────────────────── BULK WRITE CALLBACK ─────────────────── */
+
+/**
+ * POST /api/transaction-uploader/bulk-callback
+ *
+ * Catalyst calls this endpoint automatically when the bulk write job
+ * completes (success or failure). We return 200 immediately so Catalyst
+ * does not retry the callback, then queue the downstream jobs.
+ *
+ * Downstream jobs triggered on COMPLETED:
+ *   - UpdatesSecurity_ClientMasters
+ *   - CalculateHoldingMaster  (only when hasPairs = "true")
+ *   - Cal_CB_Append_TxnUpload (only when hasPairs = "true")
+ */
+export const handleBulkCallback = async (req, res) => {
+  // Always return 200 first — Catalyst retries the callback if it
+  // doesn't get a 2xx quickly, which would cause duplicate job queuing.
+  res.status(200).json({ received: true });
+
+  try {
+    const catalystApp = req.catalystApp;
+    if (!catalystApp) {
+      console.error("[BulkCallback] Catalyst app not initialized");
+      return;
+    }
+
+    const body = req.body || {};
+
+    // Catalyst sends the job status in the top-level body.
+    const status = String(body.status || "").toUpperCase();
+
+    // Our custom params are echoed back inside body.params.
+    const p = body.params || {};
+    const pipelineJobName = String(p.pipelineJobName || "").trim();
+    const holdingsPairsKey = String(p.holdingsPairsKey || "").trim();
+    const accountCodesKey = String(p.accountCodesKey || "").trim();
+    const bucketName = String(p.bucketName || BUCKET_NAME).trim();
+    const importStartedAtMs = String(p.importStartedAtMs || "").trim();
+    const objectKey = String(p.objectKey || "").trim();
+    const hasPairs = p.hasPairs === "true";
+
+    console.log(
+      `[BulkCallback] status=${status} pipelineJobName=${pipelineJobName} hasPairs=${hasPairs}`,
+    );
+
+    const zcql = catalystApp.zcql();
+
+    if (status === "FAILED") {
+      if (pipelineJobName) {
+        await updateJobsStatus(zcql, pipelineJobName, "FAILED");
+      }
+      console.error(
+        "[BulkCallback] Bulk write job FAILED — no downstream jobs queued.",
+      );
+      return;
+    }
+
+    if (status !== "COMPLETED") {
+      // Unexpected status (e.g. RUNNING sent mid-job) — ignore.
+      console.warn(`[BulkCallback] Unexpected status "${status}" — ignoring.`);
+      return;
+    }
+
+    // ── COMPLETED ──────────────────────────────────────────────────
+    if (pipelineJobName) {
+      await updateJobsStatus(zcql, pipelineJobName, "COMPLETED");
+    }
+
+    const jobScheduling = catalystApp.jobScheduling();
+
+    // 1. Sync Security_List / client master from the uploaded CSV.
+    try {
+      await jobScheduling.JOB.submitJob({
+        job_name: `USCM_${Date.now()}`.slice(0, 20),
+        jobpool_name: "UpdateMasters",
+        target_name: "UpdatesSecurity_ClientMasters",
+        target_type: "Function",
+        job_config: { number_of_retries: 5, retry_interval: 60 * 1000 },
+        params: { source: "TxnUpload", bucketName, objectKey },
+      });
+      console.log("[BulkCallback] Queued UpdatesSecurity_ClientMasters.");
+    } catch (err) {
+      console.error(
+        "[BulkCallback] Failed to queue UpdatesSecurity_ClientMasters:",
+        err.message,
+      );
+    }
+
+    if (!hasPairs) {
+      console.warn(
+        "[BulkCallback] No pairs — skipping Holdings and Cash jobs.",
+      );
+      return;
+    }
+
+    // 2. Queue CalculateHoldingMaster.
+    try {
+      await jobScheduling.JOB.submitJob({
+        job_name: `CHM_${Date.now()}`.slice(0, 20),
+        jobpool_name: "UpdateMasters",
+        target_name: "CalculateHoldingMaster",
+        target_type: "Function",
+        job_config: { number_of_retries: 5, retry_interval: 60 * 1000 },
+        params: {
+          source: "TxnUpload",
+          pairsObjectKey: holdingsPairsKey,
+          bucketName,
+          importStartedAtMs,
+        },
+      });
+      console.log("[BulkCallback] Queued CalculateHoldingMaster.");
+    } catch (err) {
+      console.error(
+        "[BulkCallback] Failed to queue CalculateHoldingMaster:",
+        err.message,
+      );
+    }
+
+    // 3. Queue Cal_CB_Append_TxnUpload — reads account codes from Stratus.
+    try {
+      const bucket = catalystApp.stratus().bucket(bucketName);
+      const accountCodesJson = await readStratusObjectAsString(
+        bucket,
+        accountCodesKey,
+      );
+
+      await jobScheduling.JOB.submitJob({
+        job_name: `CCB_${Date.now()}`.slice(0, 20),
+        jobpool_name: "UpdateMasters",
+        target_name: "Cal_CB_Append_TxnUpload",
+        target_type: "Function",
+        job_config: { number_of_retries: 5, retry_interval: 60 * 1000 },
+        params: {
+          source: "TxnUpload",
+          accountCodesJson,
+          importStartedAtMs,
+        },
+      });
+      console.log("[BulkCallback] Queued Cal_CB_Append_TxnUpload.");
+    } catch (err) {
+      console.error(
+        "[BulkCallback] Failed to queue Cal_CB_Append_TxnUpload:",
+        err.message,
+      );
+    }
+  } catch (error) {
+    console.error("[BulkCallback] Unexpected error:", error.message);
   }
 };
 
@@ -906,7 +927,9 @@ export const listUploadHistory = async (req, res) => {
 
     const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 5));
     const cursor = req.query.cursor ? String(req.query.cursor) : null;
-    const search = String(req.query.search || "").trim().toLowerCase();
+    const search = String(req.query.search || "")
+      .trim()
+      .toLowerCase();
 
     const bucket = catalystApp.stratus().bucket(BUCKET_NAME);
     const listOpts = {
@@ -938,10 +961,7 @@ export const listUploadHistory = async (req, res) => {
       if (o.key_type && o.key_type !== "file") continue;
       const parsed = parseStratusTransactionUploadKey(key);
       if (!parsed) continue;
-      if (
-        search &&
-        !parsed.originalFileName.toLowerCase().includes(search)
-      ) {
+      if (search && !parsed.originalFileName.toLowerCase().includes(search)) {
         continue;
       }
       items.push({
@@ -961,9 +981,7 @@ export const listUploadHistory = async (req, res) => {
       result.truncated === true ||
       String(result.truncated || "").toLowerCase() === "true";
     const nextCursor = truncated
-      ? result.next_continuation_token ||
-        result.nextContinuationToken ||
-        null
+      ? result.next_continuation_token || result.nextContinuationToken || null
       : null;
 
     return res.status(200).json({ success: true, items, nextCursor });
@@ -1023,10 +1041,7 @@ export const downloadUploadHistory = async (req, res) => {
       key,
     });
   } catch (error) {
-    console.error(
-      "[TempTransactionUpload] downloadUploadHistory:",
-      error
-    );
+    console.error("[TempTransactionUpload] downloadUploadHistory:", error);
     return res.status(500).json({
       success: false,
       message: error.message || "Failed to generate download link",
