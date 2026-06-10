@@ -87,27 +87,26 @@ AND executionPriority IS NULL
 
 // Fill each row with account codes. One job is triggered per row, 10 at a time.
 const accounts = [
-  [""],
-  [""],
+  [],
 ];
 
-app.post("/trigger-holding-update", async (req, res) => {
+function holdingUpdate(){ 
   const scheduling = req.catalystApp.jobScheduling();
   const ts = Date.now();
 
   for (let i = 0; i < accounts.length; i++) {
     await scheduling.JOB.submitJob({
       job_name: `HUM_${ts}_${i}`.slice(0, 50),
-      jobpool_name: "Export",
+      jobpool_name: "UpdateMasters",
       target_name: "HoldingUpdateManually",
       target_type: "Function",
-      job_config: { number_of_retries: 3, retry_interval: 60 * 1000 },
+      job_config: { number_of_retries: 1, retry_interval: 60 * 1000 },
       params: { accountCodesJson: JSON.stringify(accounts[i]) },
     });
   }
+}
 
-  return res.json({ success: true, jobsDispatched: accounts.length });
-});
+holdingUpdate();
 
 app.listen(port, () => {
   console.log(`Example app listening on port ${port}`);
