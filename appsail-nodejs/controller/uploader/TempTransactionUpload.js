@@ -854,14 +854,11 @@ export const handleBulkCallback = async (req, res) => {
       );
     }
 
-    // 3. Queue Cal_CB_Append_TxnUpload — reads account codes from Stratus.
+    // 3. Queue Cal_CB_Append_TxnUpload — it discovers affected accounts itself
+    //    from the Transaction table (CREATEDTIME >= importStartedAtMs), paging
+    //    through them with a keyset cursor. No account codes in params (avoids
+    //    the ~5000-char job-param limit) and no Stratus read.
     try {
-      const bucket = catalystApp.stratus().bucket(bucketName);
-      const accountCodesJson = await readStratusObjectAsString(
-        bucket,
-        accountCodesKey,
-      );
-
       await jobScheduling.JOB.submitJob({
         job_name: `CCB_${Date.now()}`.slice(0, 20),
         jobpool_name: "UpdateMasters",
@@ -870,8 +867,8 @@ export const handleBulkCallback = async (req, res) => {
         job_config: { number_of_retries: 5, retry_interval: 60 * 1000 },
         params: {
           source: "TxnUpload",
-          accountCodesJson,
           importStartedAtMs,
+          lastAccount: "",
         },
       });
       console.log("[BulkCallback] Queued Cal_CB_Append_TxnUpload.");

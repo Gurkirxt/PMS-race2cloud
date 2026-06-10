@@ -1,9 +1,17 @@
 /**
  * Cal_CB_Append_TxnUpload: Incremental cash passbook append after transaction CSV upload.
  *
- * - No DELETE. Appends new Transaction rows from this import only (CREATEDTIME >= importStartedAtMs).
+ * - Discovers affected accounts ITSELF from the Transaction table
+ *   (CREATEDTIME >= importStartedAtMs), paged with a keyset cursor on
+ *   WS_Account_code — so it works for any number of accounts (past the 300-row
+ *   query limit) and needs no account list in the job params (~5000-char limit).
+ * - Per account: appends new Transaction rows from this import only. Before
+ *   appending it deletes any cash rows this import already wrote for the account
+ *   (idempotent — safe to re-run after a mid-account crash).
  * - Continues Cash_Balance / Sequence from the last passbook row per account.
- * - Queued from TempTransactionUpload with source=TxnUpload, accountCodesJson, importStartedAtMs.
+ * - Self-re-triggers with lastAccount=<cursor> when near the function time limit,
+ *   resuming exactly where it stopped.
+ * - Queued from TempTransactionUpload with source=TxnUpload, importStartedAtMs, lastAccount="".
  *
  * Full rebuild: use Cal_CB_Per_TNX (manual / cron).
  */
@@ -12,6 +20,12 @@ const catalyst = require("zcatalyst-sdk-node");
 
 const BATCH_SIZE = 300;
 const CASH_UPLOAD_SOURCE = "TxnUpload";
+
+/** Stop and re-trigger once a run has used this much wall-clock (function cap ~15 min). */
+const TIME_BUDGET_MS = 13 * 60 * 1000;
+
+/** Max distinct accounts pulled per keyset page (ZCQL row cap). */
+const ACCOUNT_PAGE_SIZE = 300;
 
 const CASH_ADD = [
   "CS+",
@@ -76,35 +90,34 @@ function createdTimeFloorFromMs(ms) {
   );
 }
 
-function parseAccountCodesFromJob(jobRequest) {
-  try {
-    const p = getJobParams(jobRequest);
-    const raw = p.accountCodesJson ?? p.account_codes_json;
-    if (raw == null || raw === "") return [];
-    const arr = typeof raw === "string" ? JSON.parse(raw) : raw;
-    if (!Array.isArray(arr) || arr.length === 0) return [];
-    const out = [];
-    const seen = new Set();
-    for (const item of arr) {
-      let acc = "";
-      if (typeof item === "string") {
-        acc = item.trim();
-      } else if (Array.isArray(item) && item.length >= 1) {
-        acc = String(item[0] ?? "").trim();
-      } else if (item && typeof item === "object") {
-        acc = String(
-          item.wsAccountCode ?? item.account ?? item.WS_Account_code ?? "",
-        ).trim();
-      }
-      if (!acc || seen.has(acc)) continue;
-      seen.add(acc);
-      out.push(acc);
-    }
-    return out.sort((a, b) => a.localeCompare(b));
-  } catch (e) {
-    console.warn("parseAccountCodesFromJob:", e.message);
-    return [];
+function parseLastAccount(jobRequest) {
+  const p = getJobParams(jobRequest);
+  return String(p.lastAccount ?? p.last_account ?? "").trim();
+}
+
+/**
+ * Next page of distinct accounts touched by this import, in sorted order,
+ * strictly after `cursor`. Keyset pagination — `WS_Account_code > cursor` walks
+ * the same order `ORDER BY ... ASC` defines, so no account is skipped/repeated
+ * regardless of the codes' shape, and it pages past the 300-row query cap.
+ */
+async function fetchNextAccountsPage(zcql, createdFloor, cursor) {
+  const rows = await zcql.executeZCQLQuery(`
+    SELECT DISTINCT WS_Account_code
+    FROM Transaction
+    WHERE CREATEDTIME >= '${createdFloor}'
+      AND WS_Account_code > '${esc(cursor)}'
+    ORDER BY WS_Account_code ASC
+    LIMIT ${ACCOUNT_PAGE_SIZE}
+  `);
+  if (!rows || rows.length === 0) return [];
+  const out = [];
+  for (const row of rows) {
+    const t = row.Transaction || row;
+    const acc = String(t.WS_Account_code ?? "").trim();
+    if (acc) out.push(acc);
   }
+  return out;
 }
 
 function sortCashEvents(allEvents) {
@@ -281,7 +294,49 @@ async function insertPassbookEvents(zcql, accountCode, events, state) {
   };
 }
 
+const DELETE_LOOP_MAX_ROUNDS = 500;
+
+/**
+ * Remove any passbook rows this import already wrote for the account — cash rows
+ * are inserted while/after the import, so CREATEDTIME >= createdFloor isolates
+ * exactly this import's rows. Makes a re-run after a mid-account crash safe:
+ * the tail then reflects only pre-import rows and we rebuild this import cleanly.
+ * Catalyst caps ~300 deletes per call, so repeat until none remain.
+ */
+async function deleteThisImportCashRowsForAccount(zcql, accountCode, createdFloor) {
+  let rounds = 0;
+  while (true) {
+    const before = await zcql.executeZCQLQuery(`
+      SELECT COUNT(ROWID) FROM Cash_Balance_Per_Transaction
+      WHERE Account_Code = '${esc(accountCode)}' AND CREATEDTIME >= '${createdFloor}'
+    `);
+    const r = before?.[0]?.Cash_Balance_Per_Transaction || before?.[0] || {};
+    const remaining = Number(
+      r["COUNT(ROWID)"] ?? r.cnt ?? r["count"] ?? Object.values(r)[0] ?? 0,
+    );
+    if (remaining === 0) return;
+
+    rounds++;
+    if (rounds > DELETE_LOOP_MAX_ROUNDS) {
+      throw new Error(
+        `this-import cash delete for ${accountCode} exceeded ${DELETE_LOOP_MAX_ROUNDS} rounds (${remaining} left)`,
+      );
+    }
+
+    await zcql.executeZCQLQuery(`
+      DELETE FROM Cash_Balance_Per_Transaction
+      WHERE Account_Code = '${esc(accountCode)}' AND CREATEDTIME >= '${createdFloor}'
+    `);
+  }
+}
+
 async function incrementalAppendForAccount(zcql, accountCode, importStartedAtMs) {
+  const createdFloor = createdTimeFloorFromMs(importStartedAtMs);
+
+  // Idempotency: clear anything this import already wrote for the account (in
+  // case a previous run crashed mid-account) before re-appending.
+  await deleteThisImportCashRowsForAccount(zcql, accountCode, createdFloor);
+
   const newEvents = await fetchNewTransactionEventsSinceImport(
     zcql,
     accountCode,
@@ -308,14 +363,33 @@ async function incrementalAppendForAccount(zcql, accountCode, importStartedAtMs)
   return { inserted: result.inserted, finalBalance: result.finalBalance, skipped: false };
 }
 
+/** Re-trigger this same function to resume after `lastAccount`. */
+async function retriggerSelf(catalystApp, importStartedAtMs, lastAccount) {
+  const scheduling = catalystApp.jobScheduling();
+  await scheduling.JOB.submitJob({
+    job_name: `CCB_${Date.now()}`.slice(0, 20),
+    jobpool_name: "UpdateMasters",
+    target_name: "Cal_CB_Append_TxnUpload",
+    target_type: "Function",
+    job_config: { number_of_retries: 5, retry_interval: 60 * 1000 },
+    params: {
+      source: CASH_UPLOAD_SOURCE,
+      importStartedAtMs: String(importStartedAtMs),
+      lastAccount: String(lastAccount),
+    },
+  });
+}
+
 module.exports = async (jobRequest, context) => {
   const catalystApp = catalyst.initialize(context);
   const zcql = catalystApp.zcql();
 
   const startedAt = Date.now();
   const importStartedAtMs = parseImportStartedAtMs(jobRequest);
-  const accounts = parseAccountCodesFromJob(jobRequest);
   const counters = { accounts: 0, rows: 0, errors: 0, skipped: 0 };
+
+  // Cursor = last fully-processed account, in WS_Account_code sort order.
+  let cursor = parseLastAccount(jobRequest);
 
   try {
     if (getJobSource(jobRequest) !== CASH_UPLOAD_SOURCE) {
@@ -334,42 +408,66 @@ module.exports = async (jobRequest, context) => {
       return;
     }
 
-    if (accounts.length === 0) {
-      console.warn(
-        "Cal_CB_Append_TxnUpload: no accounts in accountCodesJson — exiting.",
-      );
-      context.closeWithSuccess();
-      return;
-    }
+    const createdFloor = createdTimeFloorFromMs(importStartedAtMs);
 
     console.log(
-      `Cal_CB_Append_TxnUpload: ${accounts.length} account(s) | run=incremental | ` +
-        `importStartedAtMs=${importStartedAtMs}`,
+      `Cal_CB_Append_TxnUpload: run=incremental | importStartedAtMs=${importStartedAtMs} | ` +
+        `createdFloor=${createdFloor} | resumeAfter="${cursor}"`,
     );
 
-    for (let ai = 0; ai < accounts.length; ai++) {
-      const accountCode = accounts[ai];
-      counters.accounts++;
-      console.log(`\n===== Account ${ai + 1}/${accounts.length}: ${accountCode} =====`);
-
-      try {
-        const result = await incrementalAppendForAccount(
-          zcql,
-          accountCode,
-          importStartedAtMs,
-        );
-        counters.rows += result.inserted;
-        if (result.skipped) counters.skipped++;
-
-        console.log(
-          `Account ${accountCode} done: ${result.inserted} row(s) appended` +
-            `${result.skipped ? " (no new cash transactions for this import)" : ""}, ` +
-            `final balance=${result.finalBalance}`,
-        );
-      } catch (err) {
-        counters.errors++;
-        console.error(`[${accountCode}] cash passbook append failed:`, err.message);
+    // INNER LOOP — page through distinct accounts past the 300-row query cap.
+    while (true) {
+      const page = await fetchNextAccountsPage(zcql, createdFloor, cursor);
+      if (page.length === 0) {
+        console.log("Cal_CB_Append_TxnUpload: no more accounts — all done.");
+        break;
       }
+
+      for (const accountCode of page) {
+        counters.accounts++;
+        console.log(`\n===== Account #${counters.accounts}: ${accountCode} =====`);
+
+        try {
+          const result = await incrementalAppendForAccount(
+            zcql,
+            accountCode,
+            importStartedAtMs,
+          );
+          counters.rows += result.inserted;
+          if (result.skipped) counters.skipped++;
+
+          console.log(
+            `Account ${accountCode} done: ${result.inserted} row(s) appended` +
+              `${result.skipped ? " (no new cash transactions for this import)" : ""}, ` +
+              `final balance=${result.finalBalance}`,
+          );
+        } catch (err) {
+          counters.errors++;
+          console.error(`[${accountCode}] cash passbook append failed:`, err.message);
+        }
+
+        // Advance cursor only after the account is FULLY processed.
+        cursor = accountCode;
+
+        // TIMEOUT GUARD — hand the rest to a fresh run before the function dies.
+        if (Date.now() - startedAt > TIME_BUDGET_MS) {
+          console.log(
+            `Cal_CB_Append_TxnUpload: time budget reached after ${counters.accounts} ` +
+              `account(s). Re-triggering with lastAccount="${cursor}".`,
+          );
+          await retriggerSelf(catalystApp, importStartedAtMs, cursor);
+          console.log(
+            `Cal_CB_Append_TxnUpload partial run in ${Date.now() - startedAt}ms: ` +
+              `${counters.accounts} account(s), ${counters.rows} row(s) appended, ` +
+              `${counters.skipped} skipped, ${counters.errors} error(s).`,
+          );
+          context.closeWithSuccess();
+          return;
+        }
+      }
+
+      // Fewer than a full page → that was the last page.
+      if (page.length < ACCOUNT_PAGE_SIZE) break;
     }
 
     console.log(
