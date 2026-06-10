@@ -9,7 +9,14 @@ const PAGE_SIZE = 10;
 
 /* Columns that the platform stores on every record — hidden from display. */
 const SYSTEM_FIELDS = ["ROWID", "CREATORID", "CREATEDTIME", "MODIFIEDTIME"];
+/* Business columns intentionally hidden from the table. */
+const HIDDEN_FIELDS = ["WS_client_id"];
 const ACCOUNT_FIELD = "WS_Account_code";
+/* Search filters on the actual (broker) code — one actual maps to many virtual codes. */
+const SEARCH_FIELD = "Actual_Code";
+
+/* Header overrides — data key stays the same, only the displayed label changes. */
+const COLUMN_LABELS = { WS_Account_code: "Virtual Code" };
 
 /* "WS_Account_code" -> "WS Account Code" */
 function prettyLabel(key) {
@@ -70,7 +77,7 @@ function ClientPage() {
     const seen = new Set();
     clients.forEach((row) =>
       Object.keys(row).forEach((k) => {
-        if (!SYSTEM_FIELDS.includes(k) && !seen.has(k)) {
+        if (!SYSTEM_FIELDS.includes(k) && !HIDDEN_FIELDS.includes(k) && !seen.has(k)) {
           seen.add(k);
           keys.push(k);
         }
@@ -81,12 +88,12 @@ function ClientPage() {
     );
   }, [clients]);
 
-  /* The search box filters the table by account code. */
+  /* The search box filters the table by actual code — returns every virtual code for it. */
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return clients;
     return clients.filter((r) =>
-      String(r[ACCOUNT_FIELD] ?? "").toLowerCase().includes(q)
+      String(r[SEARCH_FIELD] ?? "").toLowerCase().includes(q)
     );
   }, [clients, search]);
 
@@ -106,15 +113,20 @@ function ClientPage() {
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
-  /* Autocomplete suggestions — account codes of the first 50 matches. */
-  const suggestions = useMemo(
-    () =>
-      filtered
-        .slice(0, 50)
-        .map((r) => String(r[ACCOUNT_FIELD] ?? "").trim())
-        .filter(Boolean),
-    [filtered]
-  );
+  /* Autocomplete suggestions — distinct actual codes (deduped) from the matches. */
+  const suggestions = useMemo(() => {
+    const seen = new Set();
+    const out = [];
+    for (const r of filtered) {
+      const code = String(r[SEARCH_FIELD] ?? "").trim();
+      if (code && !seen.has(code)) {
+        seen.add(code);
+        out.push(code);
+      }
+      if (out.length >= 50) break;
+    }
+    return out;
+  }, [filtered]);
 
   const handleSelectSuggestion = (code) => {
     setSearch(code);
@@ -134,13 +146,13 @@ function ClientPage() {
           <div className="client-filter-card">
             <div className="cash-filter-field">
               <div className="account-code-search" ref={dropdownRef}>
-                <label className="search-label">Filter by Account Code</label>
+                <label className="search-label">Filter by Actual Code</label>
                 <div className="search-input-wrapper">
                   <span className="search-icon">&#128269;</span>
                   <input
                     type="text"
                     className="search-input"
-                    placeholder="Search Account Code..."
+                    placeholder="Search Actual Code..."
                     value={search}
                     onChange={(e) => {
                       setSearch(e.target.value);
@@ -157,7 +169,7 @@ function ClientPage() {
 
                 {showDropdown && suggestions.length > 0 && (
                   <div className="search-dropdown">
-                    <div className="dropdown-header">Account Code</div>
+                    <div className="dropdown-header">Actual Code</div>
                     <div className="dropdown-options">
                       {suggestions.map((code) => (
                         <div
@@ -204,7 +216,7 @@ function ClientPage() {
                       <thead>
                         <tr>
                           {columns.map((c) => (
-                            <th key={c}>{prettyLabel(c)}</th>
+                            <th key={c}>{COLUMN_LABELS[c] || prettyLabel(c)}</th>
                           ))}
                         </tr>
                       </thead>
