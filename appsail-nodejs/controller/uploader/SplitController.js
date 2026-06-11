@@ -255,6 +255,7 @@ export const addStockSplit = async (req, res) => {
           },
           params: {
             accountCodesJson: JSON.stringify(chunk),
+            isinsJson: JSON.stringify([isin]),
             source: "SplitController",
           },
         });
