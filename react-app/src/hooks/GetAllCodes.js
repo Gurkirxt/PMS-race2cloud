@@ -1,16 +1,26 @@
 import { useEffect, useState } from "react";
 import { BASE_URL } from "../constant.js";
 
-export function useAccountCodes() {
+/**
+ * Account-code options for the export dropdowns.
+ * `mode = "actual"` lists distinct Actual Codes (consolidated export);
+ * anything else lists virtual codes / WS_Account_code (scheme-wise export).
+ */
+export function useAccountCodes(mode = "scheme") {
   const [clientOptions, setClientOptions] = useState([]);
 
   useEffect(() => {
     fetchClientIds();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
 
   const fetchClientIds = async () => {
     try {
-      const res = await fetch(`${BASE_URL}/analytics/getAllAccountCodes`);
+      const endpoint =
+        mode === "actual"
+          ? `${BASE_URL}/analytics/getAllActualCodes`
+          : `${BASE_URL}/analytics/getAllAccountCodes`;
+      const res = await fetch(endpoint);
       const data = await res.json();
 
       const seen = new Set();

@@ -5,18 +5,29 @@ const parseCatalystTime = (ct) => {
   return isNaN(ms) ? 0 : ms;
 };
 
+/**
+ * Job/file naming per report mode. Scheme-wise keeps the original `EA_` /
+ * `ea-` names so existing exports stay reachable; consolidated uses `EAC_` /
+ * `eac-` so the two modes never collide for the same date.
+ */
+const isConsolidated = (mode) => String(mode || "").toLowerCase() === "consolidated";
+const jobNameFor = (mode, dateStr) =>
+  `${isConsolidated(mode) ? "EAC" : "EA"}_${dateStr}`;
+const fileNameFor = (mode, dateStr) =>
+  `${isConsolidated(mode) ? "eac" : "ea"}-${dateStr}.csv`;
+
 export const exportAllData = async (req, res) => {
   try {
     const catalystApp = req.catalystApp;
     const zcql = catalystApp.zcql();
     const jobScheduling = catalystApp.jobScheduling();
 
-    const { asOnDate } = req.query;
+    const { asOnDate, mode } = req.query;
     const dateStr = asOnDate || new Date().toISOString().split("T")[0];
 
     // Short names to stay within 20-char Catalyst param limit
-    const jobName = `EA_${dateStr}`;
-    const fileName = `ea-${dateStr}.csv`;
+    const jobName = jobNameFor(mode, dateStr);
+    const fileName = fileNameFor(mode, dateStr);
 
     // Check if a job for this date already exists
     const existing = await zcql.executeZCQLQuery(
@@ -57,10 +68,12 @@ export const exportAllData = async (req, res) => {
       try {
         const stratus = catalystApp.stratus();
         const bucket = stratus.bucket("upload-data-bucket");
-        // New format file
-        try { await bucket.deleteObject(`ea-${dateStr}.csv`); } catch (_) { }
-        // Old format file
-        try { await bucket.deleteObject(`all-clients-export-${dateStr}.csv`); } catch (_) { }
+        // Current (mode-aware) file
+        try { await bucket.deleteObject(fileName); } catch (_) { }
+        // Old format file (scheme-wise only)
+        if (!isConsolidated(mode)) {
+          try { await bucket.deleteObject(`all-clients-export-${dateStr}.csv`); } catch (_) { }
+        }
       } catch (stratusErr) {
         console.error("Error deleting old file from Stratus:", stratusErr);
       }
@@ -76,6 +89,7 @@ export const exportAllData = async (req, res) => {
         asOnDate: dateStr,
         jobName,
         fileName,
+        mode: isConsolidated(mode) ? "consolidated" : "scheme",
       },
     });
 
@@ -83,6 +97,7 @@ export const exportAllData = async (req, res) => {
       jobName,
       fileName,
       asOnDate: dateStr,
+      mode: isConsolidated(mode) ? "consolidated" : "scheme",
       status: "PENDING",
       createdAt: new Date().toISOString(),
       message: "Export job started",
@@ -101,9 +116,9 @@ export const getExportAllJobStatus = async (req, res) => {
     const catalystApp = req.catalystApp;
     const zcql = catalystApp.zcql();
 
-    const { asOnDate } = req.query;
+    const { asOnDate, mode } = req.query;
     const dateStr = asOnDate || new Date().toISOString().split("T")[0];
-    const jobName = `EA_${dateStr}`;
+    const jobName = jobNameFor(mode, dateStr);
 
     const result = await zcql.executeZCQLQuery(
       `SELECT ROWID, status, CREATEDTIME FROM Jobs WHERE jobName = '${jobName}' LIMIT 1`
@@ -149,9 +164,11 @@ export const getExportAllHistory = async (req, res) => {
 
     const limit = Number(req.query.limit || 10);
 
-    // ZCQL uses * as LIKE wildcard (not %)
-    // Run two queries: one for new format (EA_), one for old format (EXPORT_ALL_)
+    // ZCQL uses * as LIKE wildcard (not %); _ is literal, so 'EA_*' does not
+    // match 'EAC_...'. Run separate queries per format: scheme-wise new (EA_),
+    // consolidated (EAC_), and old format (EXPORT_ALL_).
     let newJobs = [];
+    let consolidatedJobs = [];
     let oldJobs = [];
     try {
       newJobs = await zcql.executeZCQLQuery(
@@ -159,12 +176,17 @@ export const getExportAllHistory = async (req, res) => {
       );
     } catch (e) { console.error("Error fetching new jobs:", e); }
     try {
+      consolidatedJobs = await zcql.executeZCQLQuery(
+        `SELECT jobName, status, CREATEDTIME FROM Jobs WHERE jobName LIKE 'EAC_*' ORDER BY ROWID DESC LIMIT ${limit}`
+      );
+    } catch (e) { console.error("Error fetching consolidated jobs:", e); }
+    try {
       oldJobs = await zcql.executeZCQLQuery(
         `SELECT jobName, status, CREATEDTIME FROM Jobs WHERE jobName LIKE 'EXPORT_ALL_*' ORDER BY ROWID DESC LIMIT ${limit}`
       );
     } catch (e) { console.error("Error fetching old jobs:", e); }
 
-    const allResults = [...(newJobs || []), ...(oldJobs || [])];
+    const allResults = [...(newJobs || []), ...(consolidatedJobs || []), ...(oldJobs || [])];
 
     const STALE_TIMEOUT_MS = 60 * 60 * 1000;
     const now = Date.now();
@@ -177,7 +199,11 @@ export const getExportAllHistory = async (req, res) => {
       const createdAtMs = parseCatalystTime(createdTime);
 
       let asOnDate;
-      if (jobName.startsWith("EA_")) {
+      let mode = "scheme";
+      if (jobName.startsWith("EAC_")) {
+        asOnDate = jobName.replace("EAC_", "");
+        mode = "consolidated";
+      } else if (jobName.startsWith("EA_")) {
         asOnDate = jobName.replace("EA_", "");
       } else {
         asOnDate = jobName.replace("EXPORT_ALL_", "");
@@ -198,6 +224,7 @@ export const getExportAllHistory = async (req, res) => {
       jobs.push({
         jobName,
         asOnDate,
+        mode,
         status,
         createdAt:
           createdAtMs > 0
@@ -224,13 +251,13 @@ export const downloadExportFile = async (req, res) => {
     const catalystApp = req.catalystApp;
     const zcql = catalystApp.zcql();
 
-    const { asOnDate } = req.query;
+    const { asOnDate, mode } = req.query;
     if (!asOnDate) {
       return res.status(400).json({ message: "asOnDate is required" });
     }
 
-    const jobName = `EA_${asOnDate}`;
-    const fileName = `ea-${asOnDate}.csv`;
+    const jobName = jobNameFor(mode, asOnDate);
+    const fileName = fileNameFor(mode, asOnDate);
 
     const job = await zcql.executeZCQLQuery(
       `SELECT status FROM Jobs WHERE jobName = '${jobName}' LIMIT 1`

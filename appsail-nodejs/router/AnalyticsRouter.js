@@ -1,6 +1,7 @@
 import Express from "express";
 import {
   getAllAccountCodes,
+  getAllActualCodes,
   getHoldingsSummarySimple,
 } from "../controller/analytics/tabs/holding/AnalyticsControllers.js";
 import {
@@ -11,6 +12,7 @@ import { getCashBalanceSummary } from "../controller/analytics/tabs/holding/Cash
 const router = Express.Router();
 
 router.get("/getAllAccountCodes", getAllAccountCodes);
+router.get("/getAllActualCodes", getAllActualCodes);
 router.get("/getHoldingsSummarySimple", getHoldingsSummarySimple);
 router.get("/getPaginatedTransactions", getPaginatedTransactions);
 router.get("/getSecurityNameOptions", getSecurityNameOptions);

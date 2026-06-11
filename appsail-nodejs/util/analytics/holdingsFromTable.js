@@ -32,6 +32,17 @@ export function isHoldingsSellType(type) {
 }
 
 /**
+ * The date a Holdings row should be filtered on for an as-on-date view.
+ * Mirrors the rebuild job's `getEffectiveDate`: buys (BY-/SQB/OPI) settle on
+ * SETTLEMENT_DATE, everything else takes effect on TRANSACTION_DATE.
+ */
+export function holdingsEffectiveDate(row) {
+  const setD = String(row.SETTLEMENT_DATE || "").slice(0, 10);
+  const txD = String(row.TRANSACTION_DATE || "").slice(0, 10);
+  return isHoldingsBuyType(row.TYPE) ? setD || txD : txD || setD;
+}
+
+/**
  * Pagination / sort alignment with FIFO interleaving (same-day merge order).
  */
 export function holdingsTypePriority(type) {
@@ -73,6 +84,21 @@ export async function fetchHoldingsRowsPaged(zcql, accountCode, asOnDate, extraS
     if (batch.length < BATCH) break;
     offset += BATCH;
   }
+
+  // Refine the loose SQL date clause (which ORs both dates): buy rows must
+  // respect SETTLEMENT_DATE, others TRANSACTION_DATE — same as the rebuild job.
+  // Without this, a not-yet-settled buy (e.g. OPI) leaks in via its trade date.
+  const trimmed = String(asOnDate ?? "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    const nextDay = new Date(trimmed);
+    nextDay.setDate(nextDay.getDate() + 1);
+    const cutoff = nextDay.toISOString().split("T")[0];
+    return rows.filter((r) => {
+      const d = holdingsEffectiveDate(r);
+      return !d || d < cutoff;
+    });
+  }
+
   return rows;
 }
 
