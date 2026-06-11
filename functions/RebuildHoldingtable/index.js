@@ -51,11 +51,31 @@ module.exports = async (jobRequest, context) => {
         .filter(Boolean);
     }
 
+    // Optional ISIN scope: when present, rebuild ONLY these ISIN(s) for each
+    // account instead of the account's full ISIN set. Absent → full rebuild.
+    let scopedIsins = [];
+    if (params.isinsJson) {
+      try {
+        const parsed = JSON.parse(params.isinsJson);
+        if (Array.isArray(parsed)) {
+          scopedIsins = parsed.map((i) => String(i || "").trim()).filter(Boolean);
+        }
+      } catch (e) {
+        console.error("[RebuildHoldingtable] Invalid isinsJson:", e.message);
+      }
+    }
+    if (!scopedIsins.length && params.isin) {
+      const single = String(params.isin).trim();
+      if (single) scopedIsins = [single];
+    }
+    const scopedIsinsSet = scopedIsins.length ? new Set(scopedIsins) : null;
+
     const uniq = [...new Set(accounts)];
     console.log("[RebuildHoldingtable] Start", {
       source,
       accountCount: uniq.length,
       asOnDate,
+      scopedIsins: scopedIsinsSet ? scopedIsins : "off",
     });
 
     if (!uniq.length) {
@@ -68,6 +88,7 @@ module.exports = async (jobRequest, context) => {
       zcql,
       uniq,
       asOnDate,
+      scopedIsinsSet,
     );
 
     if (counters.errors > 0) {

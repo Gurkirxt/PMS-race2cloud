@@ -138,11 +138,17 @@ async function ensureBonusRecord(zcql, { secCode, secName, isin, r1, r2, exDateI
     `);
 }
 
-async function queueRebuildHoldingsJobs(catalystApp, accountCodes, source) {
+async function queueRebuildHoldingsJobs(catalystApp, accountCodes, source, isins) {
   const uniq = [...new Set(accountCodes)]
     .map((a) => String(a || "").trim())
     .filter(Boolean);
   if (!uniq.length) return;
+
+  // Scope the rebuild to the affected ISIN(s) so each account only rebuilds
+  // those ISIN(s) instead of its full holding set.
+  const scopedIsins = [...new Set(isins || [])]
+    .map((i) => String(i || "").trim())
+    .filter(Boolean);
 
   const scheduling = catalystApp.jobScheduling();
   for (let i = 0; i < uniq.length; i += REBUILD_BATCH) {
@@ -160,6 +166,7 @@ async function queueRebuildHoldingsJobs(catalystApp, accountCodes, source) {
       },
       params: {
         accountCodesJson: JSON.stringify(chunk),
+        isinsJson: JSON.stringify(scopedIsins),
         source,
       },
     });
@@ -428,6 +435,7 @@ module.exports = async (jobRequest, context) => {
           catalystApp,
           accountsRebuild,
           "UpdateBonusTable",
+          [isin],
         );
         console.log(
           `Queued RebuildHoldingtable for ${accountsRebuild.length} account(s)`,

@@ -734,8 +734,15 @@ async function insertHoldingsRow(zcql, accountCode, row, displayIsin) {
 
 /* ============================== PER-ACCOUNT REBUILD ============================== */
 
-async function rebuildHoldingsForAccount(zcql, accountCode, asOnDate, counters) {
+async function rebuildHoldingsForAccount(
+  zcql,
+  accountCode,
+  asOnDate,
+  counters,
+  scopedIsinsSet = null,
+) {
   const t0 = Date.now();
+  const scoped = scopedIsinsSet && scopedIsinsSet.size > 0;
 
   const transactions = await fetchAccountTransactions(zcql, accountCode, asOnDate);
   const bonuses = await fetchAccountBonuses(zcql, accountCode, asOnDate);
@@ -749,12 +756,15 @@ async function rebuildHoldingsForAccount(zcql, accountCode, asOnDate, counters) 
   for (const m of mergers) if (m.ISIN) isins.add(m.ISIN);
 
   let isinList = [...isins];
-  if (ISINS_FILTER.length > 0) {
+  // The hardcoded ISINS_FILTER is a dev/debug knob; an explicit job scope
+  // (scopedIsinsSet) takes precedence over it.
+  if (!scoped && ISINS_FILTER.length > 0) {
     const allow = new Set(ISINS_FILTER.map(String));
     isinList = isinList.filter((i) => allow.has(i));
   }
 
-  const splits = await fetchSplitsForIsins(zcql, isinList, asOnDate);
+  const splitQueryIsins = scoped ? [...scopedIsinsSet].filter(Boolean) : isinList;
+  const splits = await fetchSplitsForIsins(zcql, splitQueryIsins, asOnDate);
 
   // Match dashboard behavior: ISINs that appear as Merger.OldISIN are merged
   // away — the surviving (new) ISIN is used instead.
@@ -792,12 +802,22 @@ async function rebuildHoldingsForAccount(zcql, accountCode, asOnDate, counters) 
     (mergerByIsin[m.ISIN] = mergerByIsin[m.ISIN] || []).push(m);
   }
 
-  const targetIsins = isinList.filter((i) => !mergedAwayIsins.has(i));
+  let targetIsins;
+  if (scoped) {
+    // Scoped rebuild: only the ISIN(s) the corporate action touched, for this
+    // account. ISINs the account doesn't hold yield 0 FIFO rows (harmless).
+    targetIsins = [...scopedIsinsSet]
+      .filter((i) => i && !mergedAwayIsins.has(i))
+      .sort((a, b) => a.localeCompare(b));
+  } else {
+    targetIsins = isinList.filter((i) => !mergedAwayIsins.has(i));
+  }
 
   console.log(
     `[${accountCode}] tx=${transactions.length} bon=${bonuses.length} ` +
     `spl=${splits.length} dmg=${demergers.length} mrg=${mergers.length} ` +
     `isins=${isinList.length} mergedAway=${mergedAwayIsins.size} ` +
+    `scoped=${scoped ? scopedIsinsSet.size : "off"} ` +
     `pairs=${targetIsins.length} (fetched in ${Date.now() - t0}ms)`,
   );
 
@@ -858,20 +878,35 @@ async function rebuildHoldingsForAccount(zcql, accountCode, asOnDate, counters) 
   }
 }
 
-async function rebuildHoldingsForAccountList(zcql, accountCodes, asOnDate) {
+async function rebuildHoldingsForAccountList(
+  zcql,
+  accountCodes,
+  asOnDate,
+  scopedIsinsSet = null,
+) {
   const counters = { pairs: 0, rows: 0, errors: 0 };
   const cutoff = asOnDate !== undefined && asOnDate !== null ? asOnDate : null;
   const list = Array.isArray(accountCodes) ? accountCodes : [];
   for (const accountCode of list) {
     try {
-      await rebuildHoldingsForAccount(zcql, accountCode, cutoff, counters);
+      await rebuildHoldingsForAccount(
+        zcql,
+        accountCode,
+        cutoff,
+        counters,
+        scopedIsinsSet,
+      );
     } catch (err) {
       console.error(`[RebuildHoldingtable holdings][${accountCode}]`, err.message);
       counters.errors++;
     }
   }
+  const scopeStr =
+    scopedIsinsSet && scopedIsinsSet.size > 0
+      ? `, scopedIsins=${scopedIsinsSet.size}`
+      : "";
   console.log(
-    `[RebuildHoldingtable] holdings rebuild: ${list.length} accounts, pairs=${counters.pairs}, rows=${counters.rows}, errors=${counters.errors}`
+    `[RebuildHoldingtable] holdings rebuild: ${list.length} accounts${scopeStr}, pairs=${counters.pairs}, rows=${counters.rows}, errors=${counters.errors}`
   );
   return counters;
 }

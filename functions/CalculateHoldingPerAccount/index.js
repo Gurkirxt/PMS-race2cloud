@@ -31,9 +31,9 @@ const catalyst = require("zcatalyst-sdk-node");
 /* ============================== CONFIG ============================== */
 
 /** Non-empty array = process only these WS_Account_code values; empty = all accounts found in Transaction. */
-const ACCOUNTS_FILTER = ["AYAN002"];
+const ACCOUNTS_FILTER = ["ELAYAN011", "ELAYAN005"];
 /** Non-empty array = process only these ISINs (within selected accounts); empty = all ISINs for the account. */
-const ISINS_FILTER = ["INE117A01022"];
+const ISINS_FILTER = [];
 
 /** Hard cap on number of (account, ISIN) pairs processed; 0 = unlimited. Useful for first event-fire tests. */
 const MAX_PAIRS = 0;

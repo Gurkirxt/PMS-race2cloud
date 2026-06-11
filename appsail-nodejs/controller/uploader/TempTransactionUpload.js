@@ -9,7 +9,8 @@ const TABLE_NAME = "Transaction";
 /** AppSail public base URL — used as the bulk-write callback target. */
 const APPSAIL_BASE_URL =
   process.env.CATALYST_APPSAIL_URL ||
-  "https://backend-50039746698.development.catalystappsail.in";
+  // "https://backend-50039746698.development.catalystappsail.in";
+  "http://localhost:3001"
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -667,7 +668,21 @@ export const uploadTempTransaction = async (req, res) => {
     const datastore = catalystApp.datastore();
     const bulkWrite = datastore.table(TABLE_NAME).bulkJob("write");
 
-    const callbackUrl = `${APPSAIL_BASE_URL}/api/transaction-uploader/bulk-callback`;
+    // Pipeline metadata the callback needs. Sent BOTH in the URL query string
+    // (reliable channel — Catalyst has been observed to drop the callback `params`
+    // object) and as `params` below. handleBulkCallback reads the query first.
+    const callbackParams = {
+      pipelineJobName,
+      holdingsPairsKey,
+      accountCodesKey,
+      bucketName: BUCKET_NAME,
+      importStartedAtMs: String(uploadMs),
+      objectKey,
+      hasPairs: String(hasPairs),
+    };
+    const callbackUrl =
+      `${APPSAIL_BASE_URL}/api/transaction-uploader/bulk-callback` +
+      `?${new URLSearchParams(callbackParams).toString()}`;
 
     let bulkJob;
     try {
@@ -680,15 +695,7 @@ export const uploadTempTransaction = async (req, res) => {
           operation: "insert",
           callback: {
             url: callbackUrl,
-            params: {
-              pipelineJobName,
-              holdingsPairsKey,
-              accountCodesKey,
-              bucketName: BUCKET_NAME,
-              importStartedAtMs: String(uploadMs),
-              objectKey,
-              hasPairs: String(hasPairs),
-            },
+            params: callbackParams,
           },
         },
       );
@@ -764,11 +771,23 @@ export const handleBulkCallback = async (req, res) => {
 
     const body = req.body || {};
 
+    // Diagnostic: log exactly what Catalyst delivers, so we can confirm where the
+    // callback params actually land (body.params vs. query string vs. dropped).
+    console.log(
+      "[BulkCallback RAW] body=",
+      JSON.stringify(body),
+      "query=",
+      JSON.stringify(req.query || {}),
+      "contentType=",
+      req.headers?.["content-type"] || "",
+    );
+
     // Catalyst sends the job status in the top-level body.
     const status = String(body.status || "").toUpperCase();
 
-    // Our custom params are echoed back inside body.params.
-    const p = body.params || {};
+    // Custom params travel in the callback URL query string (reliable channel);
+    // body.params is kept as a fallback in case Catalyst ever echoes them. Query wins.
+    const p = { ...(body.params || {}), ...(req.query || {}) };
     const pipelineJobName = String(p.pipelineJobName || "").trim();
     const holdingsPairsKey = String(p.holdingsPairsKey || "").trim();
     const accountCodesKey = String(p.accountCodesKey || "").trim();
