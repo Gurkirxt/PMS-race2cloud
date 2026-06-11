@@ -19,6 +19,49 @@ export const getAllAccountCodes = async (req, res) => {
   }
 };
 
+/**
+ * Distinct `Actual_Code` values from `clientIds`. Used by the consolidated
+ * holdings export, where one actual code groups several virtual codes.
+ * Returned in the same shape as `getAllAccountCodes` so the UI hook can parse
+ * either list with the same code.
+ */
+export const getAllActualCodes = async (req, res) => {
+  try {
+    const zcql = req.catalystApp.zcql();
+    const seen = new Set();
+    const codes = [];
+    let offset = 0;
+    const LIMIT = 270;
+
+    while (true) {
+      const batch = await zcql.executeZCQLQuery(
+        `SELECT Actual_Code FROM clientIds LIMIT ${LIMIT} OFFSET ${offset}`,
+      );
+      if (!batch?.length) break;
+
+      for (const r of batch) {
+        const row = r.clientIds || r;
+        const code = String(row.Actual_Code ?? "").trim();
+        if (code && !seen.has(code)) {
+          seen.add(code);
+          codes.push(code);
+        }
+      }
+
+      if (batch.length < LIMIT) break;
+      offset += LIMIT;
+    }
+
+    codes.sort((a, b) => a.localeCompare(b));
+    return res.status(200).json({
+      data: codes.map((code) => ({ clientIds: { WS_Account_code: code } })),
+    });
+  } catch (error) {
+    console.log("Error fetching actual codes", error);
+    res.status(400).json({ error: error.message });
+  }
+};
+
 export const getHoldingsSummarySimple = async (req, res) => {
   try {
     const accountCode = req.query.accountCode;

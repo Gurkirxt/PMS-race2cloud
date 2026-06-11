@@ -11,6 +11,8 @@ function formatExportTimestamp(iso) {
 }
 
 function HoldingsTab() {
+  // "scheme" = per virtual code (existing); "consolidated" = grouped by Actual Code.
+  const [reportMode, setReportMode] = useState("scheme");
   const [exportType, setExportType] = useState("all");
   const [asOnDate, setAsOnDate] = useState("");
   const [accountCode, setAccountCode] = useState("");
@@ -21,10 +23,22 @@ function HoldingsTab() {
 
   const [exportJobs, setExportJobs] = useState([]);
 
+  const isConsolidated = reportMode === "consolidated";
+
   const dropdownRef = useRef(null);
   const exportJobsRef = useRef(exportJobs);
   exportJobsRef.current = exportJobs;
-  const { clientOptions } = useAccountCodes();
+  // Consolidated mode lists Actual Codes; scheme-wise lists virtual codes.
+  const { clientOptions } = useAccountCodes(isConsolidated ? "actual" : "scheme");
+
+  /* Reset the picked account when switching report mode — the code lists differ. */
+  const handleReportModeChange = (mode) => {
+    setReportMode(mode);
+    setSearchQuery("");
+    setAccountCode("");
+    setShowDropdown(false);
+    setDownloadUrl("");
+  };
 
   /* ---------------- FILTERED OPTIONS ---------------- */
   const filteredOptions = useMemo(() => {
@@ -71,7 +85,11 @@ function HoldingsTab() {
       /* ---------- SINGLE CLIENT EXPORT ---------- */
       if (exportType === "single") {
         if (!accountCode) {
-          alert("Please select an account code");
+          alert(
+            isConsolidated
+              ? "Please select an actual code"
+              : "Please select an account code"
+          );
           return;
         }
 
@@ -79,13 +97,22 @@ function HoldingsTab() {
         setDownloadUrl("");
 
         const params = new URLSearchParams();
-        params.append("accountCode", accountCode);
         if (asOnDate) params.append("asOnDate", asOnDate);
 
-        const response = await fetch(
-          `${BASE_URL}/export/export-single?${params.toString()}`,
-          { method: "GET", credentials: "include" }
-        );
+        // Consolidated -> roll up all virtual codes under the actual code.
+        let url;
+        if (isConsolidated) {
+          params.append("actualCode", accountCode);
+          url = `${BASE_URL}/export/export-consolidated?${params.toString()}`;
+        } else {
+          params.append("accountCode", accountCode);
+          url = `${BASE_URL}/export/export-single?${params.toString()}`;
+        }
+
+        const response = await fetch(url, {
+          method: "GET",
+          credentials: "include",
+        });
 
         const data = await response.json();
         if (!response.ok) throw new Error(data.message);
@@ -103,8 +130,11 @@ function HoldingsTab() {
 
       setLoading(true);
 
+      const allParams = new URLSearchParams({ asOnDate });
+      if (isConsolidated) allParams.append("mode", "consolidated");
+
       const response = await fetch(
-        `${BASE_URL}/export/export-all?asOnDate=${asOnDate}`,
+        `${BASE_URL}/export/export-all?${allParams.toString()}`,
         { method: "GET", credentials: "include" }
       );
 
@@ -129,6 +159,7 @@ function HoldingsTab() {
           {
             jobName: data.jobName,
             asOnDate: data.asOnDate || asOnDate,
+            mode: data.mode || (isConsolidated ? "consolidated" : "scheme"),
             status: data.status,
             createdAt: data.createdAt || new Date().toISOString(),
           },
@@ -186,8 +217,10 @@ function HoldingsTab() {
           }
 
           try {
+            const statusParams = new URLSearchParams({ asOnDate: job.asOnDate });
+            if (job.mode === "consolidated") statusParams.append("mode", "consolidated");
             const res = await fetch(
-              `${BASE_URL}/export/check-status?asOnDate=${job.asOnDate}`,
+              `${BASE_URL}/export/check-status?${statusParams.toString()}`,
               { credentials: "include" }
             );
             const data = await res.json();
@@ -210,10 +243,12 @@ function HoldingsTab() {
   }, []);
 
   /* ===================== DOWNLOAD EXPORT ===================== */
-  const handleExportAllDownload = async (date) => {
+  const handleExportAllDownload = async (date, mode) => {
     try {
+      const dlParams = new URLSearchParams({ asOnDate: date });
+      if (mode === "consolidated") dlParams.append("mode", "consolidated");
       const res = await fetch(
-        `${BASE_URL}/export/download?asOnDate=${date}`,
+        `${BASE_URL}/export/download?${dlParams.toString()}`,
         { credentials: "include" }
       );
       const data = await res.json();
@@ -231,6 +266,28 @@ function HoldingsTab() {
   return (
     <>
       <h3 className="section-heading">Holdings Export</h3>
+
+      <div className="export-type">
+        <label>
+          <input
+            type="radio"
+            name="report-mode"
+            checked={reportMode === "scheme"}
+            onChange={() => handleReportModeChange("scheme")}
+          />
+          Scheme Wise
+        </label>
+
+        <label>
+          <input
+            type="radio"
+            name="report-mode"
+            checked={reportMode === "consolidated"}
+            onChange={() => handleReportModeChange("consolidated")}
+          />
+          Consolidated
+        </label>
+      </div>
 
       <div className="export-type">
         <label>
@@ -255,7 +312,9 @@ function HoldingsTab() {
       <div className="form-grid">
         {exportType === "single" && (
           <div className="account-code-search" ref={dropdownRef}>
-            <label className="search-label">Account Code</label>
+            <label className="search-label">
+              {isConsolidated ? "Actual Code" : "Account Code"}
+            </label>
 
             <div className="search-input-wrapper">
               <span className="search-icon">🔍</span>
@@ -263,7 +322,11 @@ function HoldingsTab() {
               <input
                 type="text"
                 className="search-input"
-                placeholder="Search Account Code..."
+                placeholder={
+                  isConsolidated
+                    ? "Search Actual Code..."
+                    : "Search Account Code..."
+                }
                 value={searchQuery}
                 onChange={(e) => {
                   setSearchQuery(e.target.value);
@@ -283,7 +346,11 @@ function HoldingsTab() {
 
             {showDropdown && filteredOptions.length > 0 && (
               <div className="search-dropdown">
-                <div className="dropdown-header">Search Account Code...</div>
+                <div className="dropdown-header">
+                  {isConsolidated
+                    ? "Search Actual Code..."
+                    : "Search Account Code..."}
+                </div>
 
                 <div className="dropdown-options">
                   {filteredOptions.map((opt) => (
@@ -345,6 +412,7 @@ function HoldingsTab() {
             <thead>
               <tr>
                 <th>File Name</th>
+                <th>Type</th>
                 <th>Timestamp</th>
                 <th>Status</th>
                 <th>Action</th>
@@ -354,6 +422,9 @@ function HoldingsTab() {
               {sortedExportJobs.map((job) => (
                 <tr key={job.jobName}>
                   <td>{job.jobName}</td>
+                  <td>
+                    {job.mode === "consolidated" ? "Consolidated" : "Scheme Wise"}
+                  </td>
                   <td>
                     {job.createdAt ? formatExportTimestamp(job.createdAt) : "—"}
                   </td>
@@ -373,7 +444,7 @@ function HoldingsTab() {
                     {job.status === "COMPLETED" ? (
                       <button
                         className="export-btn"
-                        onClick={() => handleExportAllDownload(job.asOnDate)}
+                        onClick={() => handleExportAllDownload(job.asOnDate, job.mode)}
                       >
                         Download
                       </button>

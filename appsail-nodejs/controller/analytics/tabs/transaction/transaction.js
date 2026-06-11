@@ -3,6 +3,18 @@ import {
   fetchSecurityListByIsins,
   holdingsTypePriority,
 } from "../../../../util/analytics/holdingsFromTable.js";
+import {
+  fetchTransactionLedgerRows,
+  fetchLedgerIsinMeta,
+} from "../../../../util/analytics/transactionHistory/ledger.js";
+
+/**
+ * Corporate-action TYPE values written into Holdings by RebuildHoldingtable.
+ * The Transaction tab shows the uploaded trade ledger (from `Transaction`) PLUS
+ * these corporate-action rows lifted from `Holdings`.
+ */
+const CORP_ACTION_TYPES = ["BONUS", "SPLIT", "MERGER", "DEMERGER"];
+const escSql = (s) => String(s ?? "").replace(/'/g, "''");
 
 /** Cash credits add (|amount| − STT); debits subtract (|amount| + STT). */
 export const applyCashEffect = (balance, tranType, amount, stt = 0) => {
@@ -115,44 +127,58 @@ export const getPaginatedTransactions = async (req, res) => {
 
     const asOnDate = normalizeDate(rawAsOnDate);
 
-    let rawHoldings = await fetchHoldingsRowsPaged(
-      zcql,
-      accountCode,
-      asOnDate,
-      "",
-    );
-    const isinSetFromRows = new Set();
-    for (const h of rawHoldings) {
-      const isin = String(h.ISIN || "").trim();
-      if (isin) isinSetFromRows.add(isin);
-    }
-    const metaByIsin = await fetchSecurityListByIsins(
-      zcql,
-      [...isinSetFromRows],
-    );
-
-    let filtered = rawHoldings;
     /*
-     * ISIN filter is preferred (uniquely identifies the security); when sent we also
-     * skip the slower name-based filter. `securityName` is kept for back-compat with
-     * any caller that might still pass it.
+     * Source 1 — uploaded trade ledger straight from the `Transaction` table.
+     * Source 2 — corporate-action rows (BONUS/SPLIT/MERGER/DEMERGER) from the
+     * materialised `Holdings` table. The two are merged into one ledger.
      */
-    if (isinFilter) {
-      filtered = rawHoldings.filter(
-        (h) => String(h.ISIN || "").trim() === isinFilter,
-      );
-    } else if (securityNameFilter) {
-      filtered = rawHoldings.filter((h) => {
-        const isin = String(h.ISIN || "").trim();
-        const nm = (
-          metaByIsin[isin]?.securityName ||
-          ""
-        ).trim();
-        return nm === securityNameFilter;
-      });
-    }
+    const corpExtra =
+      ` AND TYPE IN (${CORP_ACTION_TYPES.map((t) => `'${t}'`).join(",")})` +
+      (isinFilter ? ` AND ISIN = '${escSql(isinFilter)}'` : "");
 
-    const transactions = filtered.map((h) => {
+    const [ledgerRows, corpHoldings] = await Promise.all([
+      fetchTransactionLedgerRows(zcql, {
+        accountCode,
+        isin: isinFilter || "",
+        asOnDate,
+      }),
+      fetchHoldingsRowsPaged(zcql, accountCode, asOnDate, corpExtra),
+    ]);
+
+    /* ISINs needing a Security_List lookup: any ledger row missing a name + every corp row. */
+    const isinSetForMeta = new Set();
+    for (const r of ledgerRows) {
+      if (r.isin && !r.securityName) isinSetForMeta.add(r.isin);
+    }
+    for (const h of corpHoldings) {
+      const isin = String(h.ISIN || "").trim();
+      if (isin) isinSetForMeta.add(isin);
+    }
+    const metaByIsin = await fetchSecurityListByIsins(zcql, [...isinSetForMeta]);
+
+    const ledgerTransactions = ledgerRows.map((r) => {
+      const trd = r.trandate || "";
+      const setD = r.setdate || "";
+      const primaryDate = trd || setD || "";
+      return {
+        rowId: r.rowId,
+        date: primaryDate,
+        trandate: trd || primaryDate || null,
+        setdate: setD || trd || null,
+        executionPriority: holdingsTypePriority(r.type),
+        type: r.type,
+        securityName:
+          r.securityName || metaByIsin[r.isin]?.securityName || "—",
+        securityCode: r.securityCode || metaByIsin[r.isin]?.securityCode || "",
+        isin: r.isin,
+        quantity: r.quantity,
+        price: r.price,
+        totalAmount: r.totalAmount,
+        stt: 0,
+      };
+    });
+
+    const corpTransactions = corpHoldings.map((h) => {
       const isin = String(h.ISIN || "").trim();
       const meta = metaByIsin[isin] || {};
       const trd = String(h.TRANSACTION_DATE || "").trim().slice(0, 10);
@@ -174,6 +200,20 @@ export const getPaginatedTransactions = async (req, res) => {
         stt: 0,
       };
     });
+
+    const merged = [...ledgerTransactions, ...corpTransactions];
+
+    /*
+     * `securityName` is a legacy filter (callers normally send `isin`). When an
+     * ISIN is present it already scoped both sources, so only apply the name
+     * filter as a back-compat fallback when no ISIN was given.
+     */
+    const transactions =
+      !isinFilter && securityNameFilter
+        ? merged.filter(
+            (t) => (t.securityName || "").trim() === securityNameFilter,
+          )
+        : merged;
 
     /*
      * Display order: newest TRANDATE first.
@@ -300,23 +340,37 @@ export const getSecurityNameOptions = async (req, res) => {
       return res.status(200).json({ data: [] });
     }
 
-    const rawHoldings = await fetchHoldingsRowsPaged(
-      zcql,
-      accountCode,
-      asOnDate,
-      "",
-    );
-    const isinSet = new Set();
-    for (const h of rawHoldings) {
+    /*
+     * Securities come from the uploaded ledger (`Transaction`) plus any
+     * corporate-action ISINs materialised in `Holdings` — matching the two
+     * sources the transaction tab merges.
+     */
+    const corpExtra = ` AND TYPE IN (${CORP_ACTION_TYPES.map((t) => `'${t}'`).join(",")})`;
+    const [ledgerMeta, corpHoldings] = await Promise.all([
+      fetchLedgerIsinMeta(zcql, { accountCode, asOnDate }),
+      fetchHoldingsRowsPaged(zcql, accountCode, asOnDate, corpExtra),
+    ]);
+
+    /* Ledger names come from the Transaction table; only look up ISINs missing one. */
+    const nameByIsin = new Map(ledgerMeta);
+    for (const h of corpHoldings) {
       const isin = String(h.ISIN || "").trim();
-      if (isin) isinSet.add(isin);
+      if (isin && !nameByIsin.has(isin)) {
+        nameByIsin.set(isin, { isin, securityName: "" });
+      }
     }
-    const metaByIsin = await fetchSecurityListByIsins(zcql, [...isinSet]);
+
+    const needLookup = [...nameByIsin.values()]
+      .filter((it) => !it.securityName)
+      .map((it) => it.isin);
+    const metaByIsin = await fetchSecurityListByIsins(zcql, needLookup);
 
     const items = [];
-    for (const isin of isinSet) {
-      const securityName = (metaByIsin[isin]?.securityName || "").trim();
-      items.push({ isin, securityName });
+    for (const { isin, securityName } of nameByIsin.values()) {
+      items.push({
+        isin,
+        securityName: (securityName || metaByIsin[isin]?.securityName || "").trim(),
+      });
     }
 
     items.sort((a, b) => {
