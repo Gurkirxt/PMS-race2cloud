@@ -6,11 +6,18 @@ const { runFifoForLots } = require("./fifo.js");
 
 const REBUILD_BATCH = 400;
 
-async function queueRebuildHoldingsJobs(catalystApp, accountCodes, source) {
+async function queueRebuildHoldingsJobs(catalystApp, accountCodes, source, isins) {
   const uniq = [...new Set(accountCodes)]
     .map((a) => String(a || "").trim())
     .filter(Boolean);
   if (!uniq.length) return;
+
+  /* Scope the rebuild to the ISIN(s) this merger touched. Without this the
+     downstream RebuildHoldingtable re-derives EVERY ISIN for EVERY account,
+     which blows past the 15-min Catalyst timeout once the book is large. */
+  const scopedIsins = [...new Set(isins || [])]
+    .map((i) => String(i || "").trim().toUpperCase())
+    .filter(Boolean);
 
   const scheduling = catalystApp.jobScheduling();
   for (let i = 0; i < uniq.length; i += REBUILD_BATCH) {
@@ -18,7 +25,7 @@ async function queueRebuildHoldingsJobs(catalystApp, accountCodes, source) {
     const catalystJobName = `H${Date.now()}${i}`.slice(0, 20);
     await scheduling.JOB.submitJob({
       job_name: catalystJobName,
-      jobpool_name: "Export",
+      jobpool_name: "CorporateActions",
       target_name: "RebuildHoldingtable",
       target_type: "Function",
       /* Catalyst Job Pool: retries only on execution failure. Min interval 1m. */
@@ -29,6 +36,9 @@ async function queueRebuildHoldingsJobs(catalystApp, accountCodes, source) {
       params: {
         accountCodesJson: JSON.stringify(chunk),
         source,
+        ...(scopedIsins.length
+          ? { isinsJson: JSON.stringify(scopedIsins) }
+          : {}),
       },
     });
   }
@@ -705,6 +715,7 @@ module.exports = async (jobRequest, context) => {
           catalystApp,
           accountsAffected,
           "MegerFn",
+          [oldIsin, newIsin],
         );
         console.log(
           "[MegerFn] Queued RebuildHoldingtable for",

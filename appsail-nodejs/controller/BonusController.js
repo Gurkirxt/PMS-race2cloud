@@ -249,7 +249,7 @@ export const applyStockBonus = async (req, res) => {
 
     await jobScheduling.JOB.submitJob({
       job_name: "ApplyBonus",
-      jobpool_name: "Export",
+      jobpool_name: "CorporateActions",
       target_name: "UpdateBonusTable",
       target_type: "Function",
       /* Catalyst Job Pool: retries only run when execution fails. Min interval 1m. */
