@@ -895,7 +895,7 @@ export const getAllSecuritiesISINs = async (req, res) => {
 
       await jobScheduling.JOB.submitJob({
         job_name: "ApplyDividend",
-        jobpool_name: "Export",
+        jobpool_name: "CorporateActions",
         target_name: "UpdateDividendData",
         target_type: "Function",
         params: jobParams,

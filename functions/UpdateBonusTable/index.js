@@ -156,7 +156,7 @@ async function queueRebuildHoldingsJobs(catalystApp, accountCodes, source, isins
     const catalystJobName = `H${Date.now()}${i}`.slice(0, 20);
     await scheduling.JOB.submitJob({
       job_name: catalystJobName,
-      jobpool_name: "Export",
+      jobpool_name: "CorporateActions",
       target_name: "RebuildHoldingtable",
       target_type: "Function",
       /* Catalyst Job Pool: retries only on execution failure. Min interval 1m. */
