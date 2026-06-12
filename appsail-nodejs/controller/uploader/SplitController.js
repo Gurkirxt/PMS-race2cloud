@@ -176,7 +176,10 @@ export const previewStockSplit = async (req, res) => {
   }
 };
 
-const REBUILD_HOLDINGS_BATCH = 400;
+// Each RebuildHoldingtable job handles at most this many accounts. Smaller
+// batches → more, shorter parallel jobs (run concurrently in the job pool),
+// avoiding a single long-running job timing out as the account count grows.
+const REBUILD_HOLDINGS_BATCH = 100;
 
 export const addStockSplit = async (req, res) => {
   try {
@@ -192,9 +195,37 @@ export const addStockSplit = async (req, res) => {
     const { securityCode, securityName, ratio1, ratio2, issueDate, isin } =
       req.body;
 
-    if (!securityCode || !securityName || !ratio1 || !ratio2 || !issueDate) {
+    if (!securityCode || !securityName || !ratio1 || !ratio2 || !issueDate || !isin) {
       return res.status(400).json({
-        message: "Missing required fields",
+        message: "Missing required fields (ISIN is required to scope the holdings rebuild)",
+      });
+    }
+
+    const isinEsc = String(isin ?? "").replace(/'/g, "''");
+    const issueDateEsc = String(issueDate ?? "").replace(/'/g, "''");
+
+    // Idempotency guard (mirrors bonus's bonusRowExists): a split event is
+    // uniquely identified by ISIN + Issue_Date + ratios. If it already exists,
+    // skip the insert AND the rebuild — re-applying would otherwise insert a
+    // duplicate Split row and apply the split ratio twice.
+    const existingSplit = await zcql.executeZCQLQuery(`
+      SELECT ROWID FROM Split
+      WHERE ISIN = '${isinEsc}'
+        AND Issue_Date = '${issueDateEsc}'
+        AND Ratio1 = ${Number(ratio1)}
+        AND Ratio2 = ${Number(ratio2)}
+      LIMIT 1
+    `);
+    if (existingSplit && existingSplit.length > 0) {
+      console.log(
+        `[SplitController] Split already applied for ${isin} on ${issueDate} ` +
+          `(${ratio1}:${ratio2}) — idempotent skip, no rebuild.`,
+      );
+      return res.status(200).json({
+        success: true,
+        alreadyApplied: true,
+        message:
+          "Split already applied for this ISIN, date and ratio — skipped (no duplicate inserted).",
       });
     }
 
@@ -219,7 +250,6 @@ export const addStockSplit = async (req, res) => {
       )
     `);
 
-    const isinEsc = String(isin ?? "").replace(/'/g, "''");
     const accountSet = new Set();
     let holdOffset = 0;
 
@@ -245,7 +275,7 @@ export const addStockSplit = async (req, res) => {
         const catalystJobName = `H${Date.now()}${i}`.slice(0, 20);
         await scheduling.JOB.submitJob({
           job_name: catalystJobName,
-          jobpool_name: "Export",
+          jobpool_name: "CorporateActions",
           target_name: "RebuildHoldingtable",
           target_type: "Function",
           /* Catalyst Job Pool: retries only on execution failure. Min interval 1m. */
