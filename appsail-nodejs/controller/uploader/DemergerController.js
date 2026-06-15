@@ -27,8 +27,6 @@
  * Holdings is refreshed (`functions/RebuildHoldingtable/`).
  */
 
-import { HOLDINGS_FIFO_ORDER_BY_SQL } from "../../util/analytics/holdingsFromTable.js";
-
 const ZCQL_ROW_LIMIT = 270;
 
 const escSql = (s) => String(s ?? "").replace(/'/g, "''");
@@ -43,19 +41,21 @@ const isSellType = (t) => /^SL\+|SQS|OPO|NF-/i.test(String(t || ""));
 const upperEq = (a, b) => String(a || "").trim().toUpperCase() === b;
 
 /* ====================================================================
-   FETCH (BULK): all Holdings rows for the old ISIN ≤ recordDate in a
-   single paginated pass, grouped by account.
+   FETCH (BULK, keyset): all Holdings rows for the old ISIN ≤ recordDate,
+   grouped by account.
    --------------------------------------------------------------------
-   Replaces the previous per-account query loop in preview.
-   A widely-held ISIN (e.g. HUL) otherwise fires one sequential query
-   per holding account inside the live HTTP request, which overruns the
-   AppSail gateway timeout → the browser sees "Failed to fetch".
-   Ordering by WS_Account_code then the FIFO order keeps each account's
-   rows in the exact sequence `computeSurvivingLotsFromHoldingRows` expects.
+   Why keyset (WHERE ROWID > cursor) instead of LIMIT/OFFSET:
+   `Holdings` is the large materialized FIFO timeline. With OFFSET each
+   page re-scans + re-sorts the whole ISIN match (≈ O(n²)), which made a
+   widely-held ISIN (e.g. HUL) overrun the AppSail request budget → 408.
+   Keyset walks the ROWID primary-key index forward exactly once (no
+   re-skip, no per-page sort), so cost is ~O(n). Rows come back in global
+   ROWID order, so each account's slice is re-sorted in memory afterwards
+   into the `CREATEDTIME ASC, ROWID ASC` order the lot replay expects.
    ==================================================================== */
 async function fetchHoldingRowsByAccountForIsin(zcql, isin, recordDateISO) {
   const byAccount = new Map();
-  let offset = 0;
+  let lastRowId = "0";
   while (true) {
     const batch = await zcql.executeZCQLQuery(`
       SELECT ROWID, WS_Account_code, TRANSACTION_DATE, SETTLEMENT_DATE, TYPE, ISIN,
@@ -63,8 +63,9 @@ async function fetchHoldingRowsByAccountForIsin(zcql, isin, recordDateISO) {
       FROM Holdings
       WHERE ISIN = '${escSql(isin)}'
         AND SETTLEMENT_DATE <= '${escSql(recordDateISO)}'
-      ORDER BY WS_Account_code ASC, ${HOLDINGS_FIFO_ORDER_BY_SQL}
-      LIMIT ${ZCQL_ROW_LIMIT} OFFSET ${offset}
+        AND ROWID > ${lastRowId}
+      ORDER BY ROWID ASC
+      LIMIT ${ZCQL_ROW_LIMIT}
     `);
     if (!batch || batch.length === 0) break;
     for (const r of batch) {
@@ -78,9 +79,31 @@ async function fetchHoldingRowsByAccountForIsin(zcql, isin, recordDateISO) {
       }
       list.push(h);
     }
+    // Advance the keyset cursor to the largest ROWID in this page (rows are
+    // ROWID-ascending, so it's the last one). Guard against a non-numeric or
+    // non-advancing cursor to avoid an infinite loop.
+    const lastRow = batch[batch.length - 1].Holdings || batch[batch.length - 1];
+    const nextCursor = String(lastRow.ROWID ?? "").trim();
+    if (!/^\d+$/.test(nextCursor) || nextCursor === lastRowId) break;
+    lastRowId = nextCursor;
     if (batch.length < ZCQL_ROW_LIMIT) break;
-    offset += ZCQL_ROW_LIMIT;
   }
+
+  // Per-account FIFO ordering (mirrors the SQL `CREATEDTIME ASC, ROWID ASC`).
+  // ROWIDs are arbitrary-length positive integers — compare by length first,
+  // then lexically, so we don't lose precision past Number.MAX_SAFE_INTEGER.
+  for (const rows of byAccount.values()) {
+    rows.sort((a, b) => {
+      const ta = parseCatalystTime(a.CREATEDTIME);
+      const tb = parseCatalystTime(b.CREATEDTIME);
+      if (ta !== tb) return ta - tb;
+      const ra = String(a.ROWID ?? "0");
+      const rb = String(b.ROWID ?? "0");
+      if (ra.length !== rb.length) return ra.length - rb.length;
+      return ra < rb ? -1 : ra > rb ? 1 : 0;
+    });
+  }
+
   return byAccount;
 }
 
