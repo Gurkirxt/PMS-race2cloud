@@ -43,53 +43,45 @@ const isSellType = (t) => /^SL\+|SQS|OPO|NF-/i.test(String(t || ""));
 const upperEq = (a, b) => String(a || "").trim().toUpperCase() === b;
 
 /* ====================================================================
-   FETCH: distinct accounts holding the old ISIN (from Holdings)
+   FETCH (BULK): all Holdings rows for the old ISIN ≤ recordDate in a
+   single paginated pass, grouped by account.
+   --------------------------------------------------------------------
+   Replaces the previous per-account query loop in preview.
+   A widely-held ISIN (e.g. HUL) otherwise fires one sequential query
+   per holding account inside the live HTTP request, which overruns the
+   AppSail gateway timeout → the browser sees "Failed to fetch".
+   Ordering by WS_Account_code then the FIFO order keeps each account's
+   rows in the exact sequence `computeSurvivingLotsFromHoldingRows` expects.
    ==================================================================== */
-async function fetchAccountsHoldingIsin(zcql, isin) {
-  const accounts = new Set();
+async function fetchHoldingRowsByAccountForIsin(zcql, isin, recordDateISO) {
+  const byAccount = new Map();
   let offset = 0;
   while (true) {
     const batch = await zcql.executeZCQLQuery(`
-      SELECT WS_Account_code FROM Holdings
+      SELECT ROWID, WS_Account_code, TRANSACTION_DATE, SETTLEMENT_DATE, TYPE, ISIN,
+             QUANTITY, PRICE, TOTAL_AMOUNT, HOLDING, WAP, HOLDING_VALUE, STATUS, CREATEDTIME
+      FROM Holdings
       WHERE ISIN = '${escSql(isin)}'
-      ORDER BY ROWID ASC
+        AND SETTLEMENT_DATE <= '${escSql(recordDateISO)}'
+      ORDER BY WS_Account_code ASC, ${HOLDINGS_FIFO_ORDER_BY_SQL}
       LIMIT ${ZCQL_ROW_LIMIT} OFFSET ${offset}
     `);
     if (!batch || batch.length === 0) break;
     for (const r of batch) {
       const h = r.Holdings || r;
       const code = String(h.WS_Account_code ?? "").trim();
-      if (code) accounts.add(code);
+      if (!code) continue;
+      let list = byAccount.get(code);
+      if (!list) {
+        list = [];
+        byAccount.set(code, list);
+      }
+      list.push(h);
     }
     if (batch.length < ZCQL_ROW_LIMIT) break;
     offset += ZCQL_ROW_LIMIT;
   }
-  return [...accounts].sort((a, b) => a.localeCompare(b));
-}
-
-/* ====================================================================
-   FETCH: all Holdings rows for one (account, ISIN) ≤ recordDate
-   ==================================================================== */
-async function fetchHoldingRowsForPair(zcql, accountCode, isin, recordDateISO) {
-  const rows = [];
-  let offset = 0;
-  while (true) {
-    const batch = await zcql.executeZCQLQuery(`
-      SELECT ROWID, TRANSACTION_DATE, SETTLEMENT_DATE, TYPE, ISIN,
-             QUANTITY, PRICE, TOTAL_AMOUNT, HOLDING, WAP, HOLDING_VALUE, STATUS, CREATEDTIME
-      FROM Holdings
-      WHERE WS_Account_code = '${escSql(accountCode)}'
-        AND ISIN = '${escSql(isin)}'
-        AND SETTLEMENT_DATE <= '${recordDateISO}'
-      ORDER BY ${HOLDINGS_FIFO_ORDER_BY_SQL}
-      LIMIT ${ZCQL_ROW_LIMIT} OFFSET ${offset}
-    `);
-    if (!batch || batch.length === 0) break;
-    for (const r of batch) rows.push(r.Holdings || r);
-    if (batch.length < ZCQL_ROW_LIMIT) break;
-    offset += ZCQL_ROW_LIMIT;
-  }
-  return rows;
+  return byAccount;
 }
 
 /* ====================================================================
@@ -269,15 +261,22 @@ export const previewDemerger = async (req, res) => {
     const { r1, r2, pct, recordDateISO } = v;
     const zcql = req.catalystApp.zcql();
 
-    const accounts = await fetchAccountsHoldingIsin(zcql, oldIsin);
-    if (!accounts.length) return res.json({ success: true, data: [] });
+    // Single bulk read of all Holdings rows for the old ISIN, grouped by
+    // account in memory — avoids one sequential query per holding account,
+    // which previously timed out the request (→ "Failed to fetch") for
+    // widely-held ISINs.
+    const rowsByAccount = await fetchHoldingRowsByAccountForIsin(
+      zcql,
+      oldIsin,
+      recordDateISO,
+    );
+    if (!rowsByAccount.size) return res.json({ success: true, data: [] });
 
     const preview = [];
     let accountsWithSurvivingLots = 0;
     let totalLots = 0;
 
-    for (const accountCode of accounts) {
-      const rows = await fetchHoldingRowsForPair(zcql, accountCode, oldIsin, recordDateISO);
+    for (const [accountCode, rows] of rowsByAccount) {
       if (!rows.length) continue;
 
       const lots = computeSurvivingLotsFromHoldingRows(rows);

@@ -1,7 +1,7 @@
 import Express from "express";
 const app = Express();
 const port = process.env.X_ZOHO_CATALYST_LISTEN_PORT || 9000;
-import cors from "cors";
+// import cors from "cors";
 
 import AnalyticsRouter from "./router/AnalyticsRouter.js";
 import TransactionsRouter from "./router/TransactionRouter.js";
@@ -20,14 +20,14 @@ import MergerRouter from "./router/MergerRouter.js";
 import ClientRouter from "./router/clientRouter/ClientRouter.js";
 import SecurityRouter from "./router/securityRouter/SecurityRouter.js";
 
-app.use(
-  cors({
-    origin: "http://localhost:3000",
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  }),
-);
+// app.use(
+//   cors({
+//     origin: "http://localhost:3000",
+//     credentials: true,
+//     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+//     allowedHeaders: ["Content-Type", "Authorization"],
+//   }),
+// );
 app.use(Express.json());
 app.use(Express.urlencoded({ extended: true }));
 
@@ -70,38 +70,113 @@ app.use("/api/security", SecurityRouter);
 
 // Fill each row with account codes. One job is triggered per row, 10 at a time.
 const accounts = [
-  ["203NREAYAN", "205NREAYAN", "206NREAYAN", "209NREAYAN"],
+  [
+    "SVAYAN009",
+    "SVAYAN010",
+    "SVAYAN011",
+    "SVAYAN012",
+    "SVAYAN013",
+    "SVAYAN014",
+    "TAYAN001",
+    "TAYAN002",
+    "TAYAN003",
+    "TAYAN004",
+  ],
 
-  ["AYAN059", "AYAN064", "AYAN040", "AYAN046", "AYAN033", "AYAN034"],
+  [
+    "TAYAN005",
+    "TAYAN006",
+    "TAYAN007",
+    "TAYAN008",
+    "TAYAN009",
+    "TAYAN010",
+    "TAYAN011",
+    "TAYAN012",
+    "TAYAN013",
+    "TAYAN014",
+  ],
 
-  ["AYAN061", "AYAN001", "AYAN092", "AYAN009", "219NREAYAN", "AYAN104"],
+  [
+    "TAYAN015",
+    "TAYAN016",
+    "TAYAN017",
+    "TAYAN018",
+    "TAYAN019",
+    "TAYAN020",
+    "TAYAN021",
+    "TAYAN022",
+    "TAYAN023",
+    "TAYAN024",
+  ],
 
-  ["AYAN119", "AYAN040", "AYAN046", "AYAN058", "AYAN047", "AYAN107"],
+  [
+    "TAYAN025",
+    "TAYAN026",
+    "TAYAN027",
+    "TAYAN028",
+    "TAYAN029",
+    "TAYAN030",
+    "TAYAN031",
+    "TAYAN032",
+    "TAYAN033",
+    "TMAYAN001",
+  ],
 
-  ["AYAN045", "TAYAN012", "AYAN033", "AYAN034", "AYAN061", "AYAN001"],
+  [
+    "TMAYAN002",
+    "TMAYAN003",
+    "TMAYAN004",
+    "TMAYAN005",
+    "TMAYAN006",
+    "TMAYAN007",
+    "TMAYAN008",
+    "TMAYAN009",
+    "TMAYAN010",
+    "TMAYAN011",
+  ],
+
+  ["TMAYAN012", "TMNRE01", "TMNRE02", "TMNRE04", "WAYAN01", "WAYAN02"],
 ];
 
-// function holdingUpdate(){
-//   const scheduling = req.catalystApp.jobScheduling();
-//   const ts = Date.now();
+// Hit this route to manually trigger the holding update jobs.
+// One job is submitted per row in `accounts`.
+app.get("/api/holding-update", async (req, res) => {
+  try {
+    if (!req.catalystApp) {
+      return res
+        .status(500)
+        .json({ status: "error", message: "Catalyst app not initialized" });
+    }
 
-//   async function holdingUpdate(){
-//   const scheduling = req.catalystApp.jobScheduling();
-//   const ts = Date.now();
+    const scheduling = req.catalystApp.jobScheduling();
+    const ts = Date.now();
+    const submittedJobs = [];
 
-//   for (let i = 0; i < accounts.length; i++) {
-//     await scheduling.JOB.submitJob({
-//       job_name: `HUM_${ts}_${i}`.slice(0, 50),
-//       jobpool_name: "UpdateMasters",
-//       target_name: "HoldingUpdateManually",
-//       target_type: "Function",
-//       job_config: { number_of_retries: 1, retry_interval: 60 * 1000 },
-//       params: { accountCodesJson: JSON.stringify(accounts[i]) },
-//     });
-//   }
-// }
+    for (let i = 0; i < accounts.length; i++) {
+      const job = await scheduling.JOB.submitJob({
+        job_name: `HUM_${ts}_${i}`.slice(0, 50),
+        jobpool_name: "UpdateMasters",
+        target_name: "HoldingUpdateManually",
+        target_type: "Function",
+        job_config: { number_of_retries: 1, retry_interval: 60 * 1000 },
+        params: { accountCodesJson: JSON.stringify(accounts[i]) },
+      });
+      submittedJobs.push(job);
+    }
 
-// holdingUpdate();
+    res.status(200).json({
+      status: "ok",
+      message: `Submitted ${submittedJobs.length} holding update job(s)`,
+      count: submittedJobs.length,
+    });
+  } catch (err) {
+    console.error("Holding update error:", err);
+    res.status(500).json({
+      status: "error",
+      message: err.message || "Failed to submit jobs",
+    });
+  }
+});
 
 app.listen(port, () => {
   console.log(`Example app listening on port ${port}`);
