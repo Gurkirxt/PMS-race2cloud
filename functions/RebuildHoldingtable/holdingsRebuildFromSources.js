@@ -351,7 +351,9 @@ function runFifoEngine(
         const td = m.TRANDATE || m.trandate;
         return {
           type: "MERGER",
-          date: normalizeDate(td),
+          // Group/sort the merger event by its record date, not the per-lot
+          // trade date (TRANDATE now carries the original lot's trade date).
+          date: normalizeDate(m.Record_Date || m.record_date || td),
           data: {
             qty: Number(m.Quantity ?? m.quantity ?? m.Holding ?? 0) || 0,
             price: Number(m.WAP ?? m.wap ?? 0) || 0,
@@ -360,6 +362,8 @@ function runFifoEngine(
             setdate: m.SETDATE || m.setdate || td,
             isin: m.ISIN || m.isin,
             oldIsin: m.OldISIN || m.oldIsin || "",
+            // Corporate-action (merger) record date → Holdings.CA_DATE.
+            recordDate: m.Record_Date || m.record_date || "",
           },
         };
       }),
@@ -617,7 +621,9 @@ function runFifoEngine(
       if (!price && totalAmount && qty) price = totalAmount / qty;
       if (!totalAmount && price && qty) totalAmount = qty * price;
 
-      const mergerDate = normalizeDate(e.data.trandate);
+      // Group all rows of one merger event by record date + old ISIN (the
+      // per-lot trandate now varies, so it can't be the grouping key).
+      const mergerDate = normalizeDate(e.data.recordDate || e.data.trandate);
       const eventKey = `${mergerDate}|${e.data.oldIsin || ""}`;
 
       if (eventKey !== lastMergerEventKey) {
@@ -660,6 +666,7 @@ function runFifoEngine(
         profitLoss: null,
         isActive: true,
         isin: e.data.isin,
+        caDate: e.data.recordDate || "",
       });
     }
   }
@@ -710,10 +717,15 @@ async function insertHoldingsRow(zcql, accountCode, row, displayIsin) {
       : Number(row.profitLoss);
   const status = row.isActive ? "true" : "false";
 
+  // Corporate-action date (e.g. merger record date). Only set on rows that
+  // carry one (MERGER); NULL otherwise so it's a true date column.
+  const caDateRaw = row.caDate ? sqlDate(row.caDate) : "";
+  const caDateSql = caDateRaw ? `'${esc(caDateRaw)}'` : "NULL";
+
   await zcql.executeZCQLQuery(`
     INSERT INTO Holdings (
       WS_Account_code, TRANSACTION_DATE, SETTLEMENT_DATE, TYPE, ISIN,
-      QUANTITY, PRICE, TOTAL_AMOUNT, HOLDING, WAP, HOLDING_VALUE, P_L, STATUS
+      QUANTITY, PRICE, TOTAL_AMOUNT, HOLDING, WAP, HOLDING_VALUE, P_L, STATUS, CA_DATE
     ) VALUES (
       '${esc(accountCode)}',
       '${esc(txD)}',
@@ -727,7 +739,8 @@ async function insertHoldingsRow(zcql, accountCode, row, displayIsin) {
       ${wap},
       ${hv},
       ${pl},
-      ${status}
+      ${status},
+      ${caDateSql}
     )
   `);
 }

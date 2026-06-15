@@ -112,6 +112,12 @@ function TransactionPage({ stock, accountCode, asOnDate, onClose }) {
   );
   const avgPrice = lastTransaction?.averageCostOfHoldings || 0;
 
+  // Only surface the Merger Date column for a security that actually merged
+  // (i.e. has TYPE=MERGER rows). Hidden for everything else.
+  const showMergerDate = transactions.some(
+    (t) => String(t.tranType || "").toUpperCase() === "MERGER",
+  );
+
   return (
     <div className="hd-overlay">
       <div className="hd-container">
@@ -169,6 +175,7 @@ function TransactionPage({ stock, accountCode, asOnDate, onClose }) {
                 <tr>
                   <th>Transaction Date</th>
                   <th>Settlement Date</th>
+                  {showMergerDate && <th>Merger Date</th>}
                   <th>Type</th>
                   <th>ISIN</th>
                   <th>Quantity</th>
@@ -184,7 +191,7 @@ function TransactionPage({ stock, accountCode, asOnDate, onClose }) {
                 {transactions.length === 0 ? (
                   <tr>
                     <td
-                      colSpan="11"
+                      colSpan={showMergerDate ? 12 : 11}
                       style={{
                         textAlign: "center",
                         padding: "40px",
@@ -199,6 +206,7 @@ function TransactionPage({ stock, accountCode, asOnDate, onClose }) {
                     <tr key={idx} className={getRowClass(tx.tranType)}>
                       <td>{tx.originalTrandate || tx.trandate || "-"}</td>
                       <td>{tx.setdate || "-"}</td>
+                      {showMergerDate && <td>{tx.caDate || "-"}</td>}
                       <td>{tx.tranType || "-"}</td>
                       <td>{tx.isin || "-"}</td>
                       <td>

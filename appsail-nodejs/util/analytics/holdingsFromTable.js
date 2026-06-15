@@ -71,7 +71,7 @@ export async function fetchHoldingsRowsPaged(zcql, accountCode, asOnDate, extraS
     const batch = await zcql.executeZCQLQuery(`
       SELECT ROWID, TRANSACTION_DATE, SETTLEMENT_DATE, TYPE, ISIN,
              QUANTITY, PRICE, TOTAL_AMOUNT, HOLDING, WAP, HOLDING_VALUE, P_L, STATUS,
-             CREATEDTIME
+             CA_DATE, CREATEDTIME
       FROM Holdings
       WHERE WS_Account_code = '${acc}'
       ${clause}
@@ -234,5 +234,7 @@ export function mapHoldingsRowToStockHistoryDto(h, isinFromQuery) {
     profitLoss: Number.isFinite(plNum) ? plNum : null,
     isActive,
     isin: String(h.ISIN || isinFromQuery || "").trim(),
+    // Corporate-action date (e.g. merger record date); blank for normal rows.
+    caDate: String(h.CA_DATE || "").slice(0, 10) || null,
   };
 }
