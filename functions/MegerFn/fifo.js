@@ -83,6 +83,9 @@ function runFifoForLots(transactions, bonuses, splits, demergers, mergers, mode)
             netrate: t.NETRATE || t.netrate,
             netAmount: t.NETAMOUNT || t.netAmount || t.Net_Amount || 0,
             originalTrandate: normalizeDate(t.TRANDATE || t.trandate || eventDate),
+            originalSetdate: normalizeDate(
+              t.SETDATE || t.setdate || t.TRANDATE || t.trandate || eventDate,
+            ),
             isin: t.ISIN || t.isin,
           },
         };
@@ -191,6 +194,7 @@ function runFifoForLots(transactions, bonuses, splits, demergers, mergers, mode)
           qty,
           price,
           originalTrandate: t.originalTrandate,
+          originalSetdate: t.originalSetdate,
           isActive: true,
         });
         holdings += qty;
@@ -327,6 +331,7 @@ function runFifoForLots(transactions, bonuses, splits, demergers, mergers, mode)
       sourceRowId: lot.sourceRowId,
       sourceType: lot.sourceType,
       originalTrandate: lot.originalTrandate,
+      originalSetdate: lot.originalSetdate,
       qty: lot.qty,
       costPerShare: lot.price,
       totalCost: lot.qty * lot.price,
