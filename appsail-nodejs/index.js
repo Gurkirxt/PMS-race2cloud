@@ -28,6 +28,7 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
 );
+
 app.use(Express.json());
 app.use(Express.urlencoded({ extended: true }));
 
@@ -69,74 +70,7 @@ app.use("/api/client", ClientRouter);
 app.use("/api/security", SecurityRouter);
 
 // Fill each row with account codes. One job is triggered per row, 10 at a time.
-const accounts = [
-  [
-    "SVAYAN009",
-    "SVAYAN010",
-    "SVAYAN011",
-    "SVAYAN012",
-    "SVAYAN013",
-    "SVAYAN014",
-    "TAYAN001",
-    "TAYAN002",
-    "TAYAN003",
-    "TAYAN004",
-  ],
-
-  [
-    "TAYAN005",
-    "TAYAN006",
-    "TAYAN007",
-    "TAYAN008",
-    "TAYAN009",
-    "TAYAN010",
-    "TAYAN011",
-    "TAYAN012",
-    "TAYAN013",
-    "TAYAN014",
-  ],
-
-  [
-    "TAYAN015",
-    "TAYAN016",
-    "TAYAN017",
-    "TAYAN018",
-    "TAYAN019",
-    "TAYAN020",
-    "TAYAN021",
-    "TAYAN022",
-    "TAYAN023",
-    "TAYAN024",
-  ],
-
-  [
-    "TAYAN025",
-    "TAYAN026",
-    "TAYAN027",
-    "TAYAN028",
-    "TAYAN029",
-    "TAYAN030",
-    "TAYAN031",
-    "TAYAN032",
-    "TAYAN033",
-    "TMAYAN001",
-  ],
-
-  [
-    "TMAYAN002",
-    "TMAYAN003",
-    "TMAYAN004",
-    "TMAYAN005",
-    "TMAYAN006",
-    "TMAYAN007",
-    "TMAYAN008",
-    "TMAYAN009",
-    "TMAYAN010",
-    "TMAYAN011",
-  ],
-
-  ["TMAYAN012", "TMNRE01", "TMNRE02", "TMNRE04", "WAYAN01", "WAYAN02"],
-];
+const accounts = [["TESTAC"]];
 
 // Hit this route to manually trigger the holding update jobs.
 // One job is submitted per row in `accounts`.

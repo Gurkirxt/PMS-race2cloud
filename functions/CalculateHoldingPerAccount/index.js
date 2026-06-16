@@ -680,6 +680,12 @@ function runFifoEngine(
           remaining -= used;
           if (lot.qty === 0) {
             lot.isActive = false;
+            // Fully consumed by this sell → flag the buy's output row inactive
+            // too (Holdings.STATUS=false), so the UI shows it as "Inactive".
+            const soldRow = output.find(
+              (o) => o.lotId === lot.lotId && o.isActive,
+            );
+            if (soldRow) soldRow.isActive = false;
             buyQueue.shift();
           }
         }
