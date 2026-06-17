@@ -332,11 +332,17 @@ function runFifoEngine(
       .filter((d) => (d.ISIN || d.isin) === activeIsin)
       .map((d) => {
         const td = d.TRANDATE || d.trandate;
+        // Column is `Record_date` in Demerger_Record — reads are case-sensitive,
+        // so check every casing. May also come back as a DATETIME
+        // ("2026-08-27 00:00:00"); keep only yyyy-mm-dd so normalizeDate/sort work.
+        const recDate = String(
+          d.Record_Date || d.Record_date || d.record_date || "",
+        ).slice(0, 10);
         return {
           type: "DEMERGER",
           // Group/sort the demerger event by its record date, not the per-lot
           // trade date (TRANDATE now carries the original lot's trade date).
-          date: normalizeDate(d.Record_Date || d.record_date || td),
+          date: normalizeDate(recDate || td),
           data: {
             qty: d.QTY ?? d.qty,
             price: d.PRICE ?? d.price,
@@ -346,7 +352,7 @@ function runFifoEngine(
             setdate: d.SETDATE || d.setdate || td,
             isin: d.ISIN || d.isin,
             // Corporate-action (demerger) record date → Holdings.CA_DATE.
-            recordDate: d.Record_Date || d.record_date || "",
+            recordDate: recDate || "",
           },
         };
       }),
@@ -354,11 +360,16 @@ function runFifoEngine(
       .filter((m) => (m.ISIN || m.isin) === activeIsin)
       .map((m) => {
         const td = m.TRANDATE || m.trandate;
+        // Check every casing of the record-date column (reads are case-sensitive).
+        // May also come back as a DATETIME; keep only yyyy-mm-dd.
+        const recDate = String(
+          m.Record_Date || m.Record_date || m.record_date || "",
+        ).slice(0, 10);
         return {
           type: "MERGER",
           // Group/sort the merger event by its record date, not the per-lot
           // trade date (TRANDATE now carries the original lot's trade date).
-          date: normalizeDate(m.Record_Date || m.record_date || td),
+          date: normalizeDate(recDate || td),
           data: {
             qty: Number(m.Quantity ?? m.quantity ?? m.Holding ?? 0) || 0,
             price: Number(m.WAP ?? m.wap ?? 0) || 0,
@@ -368,7 +379,7 @@ function runFifoEngine(
             isin: m.ISIN || m.isin,
             oldIsin: m.OldISIN || m.oldIsin || "",
             // Corporate-action (merger) record date → Holdings.CA_DATE.
-            recordDate: m.Record_Date || m.record_date || "",
+            recordDate: recDate || "",
           },
         };
       }),
