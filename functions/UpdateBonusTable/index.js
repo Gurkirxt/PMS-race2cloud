@@ -192,6 +192,13 @@ module.exports = async (jobRequest, context) => {
     const bonusJobType =
       String(params.jobType || "").trim() || BONUS_JOB_TYPE_DEFAULT;
     const trackingOn = Boolean(String(jobName || "").trim());
+    // Recompute mode: a split was uploaded on/after this bonus's ex-date, so the
+    // previously stored BonusShare was sized on the pre-split holding and is now
+    // stale. In this mode an existing Bonus row is OVERWRITTEN (not skipped) with
+    // a freshly sized count. The split row already exists in the DB by the time
+    // this runs, so the FIFO holding below is post-split.
+    const recompute =
+      String(params.recompute || "").trim().toLowerCase() === "true";
 
     try {
       await zcql.executeZCQLQuery(
@@ -345,7 +352,13 @@ module.exports = async (jobRequest, context) => {
           continue;
         }
 
-        const bonuses = bonusByAcc[accountCode] || [];
+        // Size this bonus on the holding BEFORE this bonus is added. Exclude any
+        // Bonus row sharing this ex-date (only present on recompute, where the
+        // stale row already exists) so the FIFO basis is the post-split holding,
+        // not post-split + stale-bonus.
+        const bonuses = (bonusByAcc[accountCode] || []).filter(
+          (b) => String(b.ExDate || b.exDate || "").slice(0, 10) !== exDateISO,
+        );
 
         const fifo = runFifoEngine(tx, bonuses, splits, true);
         if (!fifo || fifo.holdings <= 0) {
@@ -360,9 +373,23 @@ module.exports = async (jobRequest, context) => {
         }
 
         if (await bonusRowExists(zcql, isin, accountCode, exDateISO)) {
-          console.log(
-            `[UpdateBonusTable] Bonus row already present for ${accountCode} — idempotent`,
-          );
+          if (recompute) {
+            // Split-driven re-size: overwrite the stale (pre-split) BonusShare.
+            await zcql.executeZCQLQuery(`
+              UPDATE Bonus
+              SET BonusShare = ${bonusShares}
+              WHERE ISIN = '${esc(isin)}'
+                AND WS_Account_code = '${esc(accountCode)}'
+                AND ExDate = '${esc(exDateISO)}'
+            `);
+            console.log(
+              `[UpdateBonusTable] Bonus recomputed for ${accountCode}: ${bonusShares} shares (post-split)`,
+            );
+          } else {
+            console.log(
+              `[UpdateBonusTable] Bonus row already present for ${accountCode} — idempotent`,
+            );
+          }
           if (trackingOn) await markAccountSuccess(zcql, jobName, accountCode);
           accountsRebuild.push(accountCode);
           inserted++;

@@ -292,6 +292,59 @@ export const addStockSplit = async (req, res) => {
       }
     }
 
+    // A bonus already applied on/after this split's date had its BonusShare
+    // sized on the PRE-split holding — it is now stale. Re-run the bonus apply
+    // in recompute mode (the Split row above is now in the DB, so the bonus
+    // FIFO will re-size on the post-split holding and overwrite BonusShare).
+    // The recompute job re-queues its own RebuildHoldingtable afterward.
+    try {
+      const bonusRecords = await zcql.executeZCQLQuery(`
+        SELECT SecurityCode, SecurityName, ISIN, Ratio1, Ratio2, ExDate
+        FROM Bonus_Record
+        WHERE ISIN = '${isinEsc}' AND ExDate >= '${issueDateEsc}'
+        ORDER BY ExDate ASC
+      `);
+
+      const scheduling = app.jobScheduling();
+      for (const row of bonusRecords || []) {
+        const b = row.Bonus_Record || row;
+        const exDateISO = String(b.ExDate || "").slice(0, 10);
+        if (!exDateISO) continue;
+
+        // Unique tracking name so UpdateBonusTable's per-account SUCCESS guard
+        // (scoped by jobName) does not skip a prior bonus run for this ex-date.
+        const bonusJobName = `BONRC_${isin.slice(-6)}_${exDateISO}_${Date.now()}`;
+        await scheduling.JOB.submitJob({
+          job_name: `BRC${Date.now()}`.slice(0, 20),
+          jobpool_name: "CorporateActions",
+          target_name: "UpdateBonusTable",
+          target_type: "Function",
+          job_config: {
+            number_of_retries: 5,
+            retry_interval: 60 * 1000,
+          },
+          params: {
+            isin,
+            ratio1: String(Number(b.Ratio1) || 0),
+            ratio2: String(Number(b.Ratio2) || 0),
+            exDate: exDateISO,
+            secCode: b.SecurityCode || securityCode || "",
+            secName: b.SecurityName || securityName || "",
+            recompute: "true",
+            jobName: bonusJobName,
+          },
+        });
+        console.log(
+          `[SplitController] Queued bonus recompute for ${isin} ex-date ${exDateISO}`,
+        );
+      }
+    } catch (recomputeErr) {
+      console.error(
+        "[SplitController] Failed to queue bonus recompute:",
+        recomputeErr.message,
+      );
+    }
+
     return res.status(200).json({
       success: true,
       message: "Stock split applied successfully",

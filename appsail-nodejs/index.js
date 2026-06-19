@@ -70,7 +70,20 @@ app.use("/api/client", ClientRouter);
 app.use("/api/security", SecurityRouter);
 
 // Fill each row with account codes. One job is triggered per row, 10 at a time.
-const accounts = [["TESTAC"]];
+const accounts = [
+  [
+    // "AYAN126",
+    // "AYAN111",
+    // "AYAN064",
+    // "AYAN066",
+    // "AYAN067",
+    "AYAN037",
+    "AYAN039",
+    "AYAN040",
+    "AYAN023",
+    "AYAN021",
+  ],
+];
 
 // Hit this route to manually trigger the holding update jobs.
 // One job is submitted per row in `accounts`.
