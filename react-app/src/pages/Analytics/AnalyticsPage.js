@@ -302,8 +302,8 @@ function AnalyticsPage() {
           </button>
         ))}
       </div>
-      {/* Holding Summary – only for Holding tab */}
-      {activeTab === "holding" && (
+      {/* Holding Summary – only for Holding tab, once an account is selected */}
+      {activeTab === "holding" && accountCode && (
         <div className="holding-summary-table">
           <div className="summary-table-header">
             <h3>Holding Summary</h3>

@@ -272,7 +272,9 @@ function SplitPage() {
 
           {/* RATIOS */}
           <div className="split-field">
-            <label>Ratio 1</label>
+            <label>
+              Ratio <span className="ratio-hint">(For every)</span>
+            </label>
             <input
               type="number"
               value={ratio1}
@@ -281,7 +283,9 @@ function SplitPage() {
           </div>
 
           <div className="split-field">
-            <label>Ratio 2</label>
+            <label>
+              Ratio <span className="ratio-hint">(Investor gets)</span>
+            </label>
             <input
               type="number"
               value={ratio2}
@@ -341,7 +345,7 @@ function SplitPage() {
                         <td>{row.accountCode}</td>
                         <td>{Math.floor(Number(row.currentHolding) || 0)}</td>
                         <td>{Math.floor(Number(row.newHolding) || 0)}</td>
-                        <td style={{ color: "#166534", fontWeight: 600 }}>
+                        <td className="delta-cell">
                           {row.delta > 0 ? `+${row.delta}` : row.delta}
                         </td>
                       </tr>
