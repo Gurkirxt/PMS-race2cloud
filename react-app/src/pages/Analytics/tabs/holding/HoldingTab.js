@@ -15,6 +15,9 @@ const HoldingTab = ({
   onPageChange,
   onPageSizeChange,
 }) => {
+  // Hide the Stock Holdings grid until an account is selected.
+  if (!accountCode) return null;
+
   const displayedHoldings = Array.isArray(holdings)
     ? holdings
     : [];

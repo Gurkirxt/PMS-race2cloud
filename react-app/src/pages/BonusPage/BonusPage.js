@@ -268,20 +268,24 @@ function BonusPage() {
           </div>
 
           <div className="bonus-field">
-            <label>Ratio 1</label>
-            <input
-              type="number"
-              value={ratio1}
-              onChange={(e) => setRatio1(e.target.value)}
-            />
-          </div>
-
-          <div className="bonus-field">
-            <label>Ratio 2</label>
+            <label>
+              Ratio <span className="ratio-hint">(For every held)</span>
+            </label>
             <input
               type="number"
               value={ratio2}
               onChange={(e) => setRatio2(e.target.value)}
+            />
+          </div>
+
+          <div className="bonus-field">
+            <label>
+              Ratio <span className="ratio-hint">(Bonus shares)</span>
+            </label>
+            <input
+              type="number"
+              value={ratio1}
+              onChange={(e) => setRatio1(e.target.value)}
             />
           </div>
 
