@@ -268,6 +268,7 @@ function runFifoEngine(
   const buyQueue = [];
   const output = [];
   let lastMergerEventKey = null;
+  let lastDemergerEventKey = null;
 
   const normalizeDate = (rawDate) => {
     if (!rawDate) return null;
@@ -331,9 +332,17 @@ function runFifoEngine(
       .filter((d) => (d.ISIN || d.isin) === activeIsin)
       .map((d) => {
         const td = d.TRANDATE || d.trandate;
+        // Column is `Record_date` in Demerger_Record — reads are case-sensitive,
+        // so check every casing. May also come back as a DATETIME
+        // ("2026-08-27 00:00:00"); keep only yyyy-mm-dd so normalizeDate/sort work.
+        const recDate = String(
+          d.Record_Date || d.Record_date || d.record_date || "",
+        ).slice(0, 10);
         return {
           type: "DEMERGER",
-          date: normalizeDate(td),
+          // Group/sort the demerger event by its record date, not the per-lot
+          // trade date (TRANDATE now carries the original lot's trade date).
+          date: normalizeDate(recDate || td),
           data: {
             qty: d.QTY ?? d.qty,
             price: d.PRICE ?? d.price,
@@ -342,6 +351,8 @@ function runFifoEngine(
             trandate: td,
             setdate: d.SETDATE || d.setdate || td,
             isin: d.ISIN || d.isin,
+            // Corporate-action (demerger) record date → Holdings.CA_DATE.
+            recordDate: recDate || "",
           },
         };
       }),
@@ -349,11 +360,16 @@ function runFifoEngine(
       .filter((m) => (m.ISIN || m.isin) === activeIsin)
       .map((m) => {
         const td = m.TRANDATE || m.trandate;
+        // Check every casing of the record-date column (reads are case-sensitive).
+        // May also come back as a DATETIME; keep only yyyy-mm-dd.
+        const recDate = String(
+          m.Record_Date || m.Record_date || m.record_date || "",
+        ).slice(0, 10);
         return {
           type: "MERGER",
           // Group/sort the merger event by its record date, not the per-lot
           // trade date (TRANDATE now carries the original lot's trade date).
-          date: normalizeDate(m.Record_Date || m.record_date || td),
+          date: normalizeDate(recDate || td),
           data: {
             qty: Number(m.Quantity ?? m.quantity ?? m.Holding ?? 0) || 0,
             price: Number(m.WAP ?? m.wap ?? 0) || 0,
@@ -363,7 +379,7 @@ function runFifoEngine(
             isin: m.ISIN || m.isin,
             oldIsin: m.OldISIN || m.oldIsin || "",
             // Corporate-action (merger) record date → Holdings.CA_DATE.
-            recordDate: m.Record_Date || m.record_date || "",
+            recordDate: recDate || "",
           },
         };
       }),
@@ -441,6 +457,12 @@ function runFifoEngine(
           remaining -= used;
           if (lot.qty === 0) {
             lot.isActive = false;
+            // Fully consumed by this sell → flag the buy's output row inactive
+            // too (Holdings.STATUS=false), so the UI shows it as "Inactive".
+            const soldRow = output.find(
+              (o) => o.lotId === lot.lotId && o.isActive,
+            );
+            if (soldRow) soldRow.isActive = false;
             buyQueue.shift();
           }
         }
@@ -572,15 +594,25 @@ function runFifoEngine(
       if (!price && totalAmount && qty) price = totalAmount / qty;
       if (!totalAmount && price && qty) totalAmount = qty * price;
 
-      const activeLots = buyQueue.filter((l) => l.isActive);
-      for (const oldLot of activeLots) {
-        oldLot.isActive = false;
-        const oldRow = output.find((r) => r.lotId === oldLot.lotId && r.isActive);
-        if (oldRow) oldRow.isActive = false;
-      }
-      buyQueue.length = 0;
+      // Group all rows of one demerger event by record date (the per-lot
+      // trandate now varies, so it can't be the grouping key). Close prior lots
+      // once per event, then accumulate each surviving lot so every lot's
+      // original trade date is preserved (matches the MERGER handler).
+      const demergerDate = normalizeDate(e.data.recordDate || e.data.trandate);
+      const eventKey = `${demergerDate}|${e.data.isin || ""}`;
 
-      const demergerDate = normalizeDate(e.data.trandate);
+      if (eventKey !== lastDemergerEventKey) {
+        const activeLots = buyQueue.filter((l) => l.isActive);
+        for (const oldLot of activeLots) {
+          oldLot.isActive = false;
+          const oldRow = output.find((r) => r.lotId === oldLot.lotId && r.isActive);
+          if (oldRow) oldRow.isActive = false;
+        }
+        buyQueue.length = 0;
+        holdings = 0;
+        lastDemergerEventKey = eventKey;
+      }
+
       const lotId = ++lotCounter;
 
       buyQueue.push({
@@ -592,7 +624,7 @@ function runFifoEngine(
         isActive: true,
       });
 
-      holdings = qty;
+      holdings += qty;
 
       output.push({
         lotId,
@@ -609,6 +641,7 @@ function runFifoEngine(
         profitLoss: null,
         isActive: true,
         isin: e.data.isin,
+        caDate: e.data.recordDate || "",
       });
     }
 

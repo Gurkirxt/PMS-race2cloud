@@ -14,8 +14,11 @@ async function queueRebuildHoldingsJobs(catalystApp, accountCodes, source, isins
   /* Scope the rebuild to the ISIN(s) this demerger touched (old + new).
      Without this the downstream RebuildHoldingtable re-derives EVERY ISIN for
      EVERY account, which blows past the 15-min Catalyst timeout on a large book. */
+  /* Do NOT change case here — the rebuild scope must match the EXACT ISIN case
+     stored by the apply (demerger preserves the typed case, e.g. "testNewSec101").
+     Uppercasing made the scoped rebuild miss the new ISIN entirely. */
   const scopedIsins = [...new Set(isins || [])]
-    .map((i) => String(i || "").trim().toUpperCase())
+    .map((i) => String(i || "").trim())
     .filter(Boolean);
 
   const scheduling = catalystApp.jobScheduling();

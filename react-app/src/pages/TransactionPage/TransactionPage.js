@@ -118,6 +118,16 @@ function TransactionPage({ stock, accountCode, asOnDate, onClose }) {
     (t) => String(t.tranType || "").toUpperCase() === "MERGER",
   );
 
+  // Same idea for demergers: show the Demerger Date column (record date, from
+  // Holdings.CA_DATE) only for a security that actually demerged.
+  const showDemergerDate = transactions.some(
+    (t) => String(t.tranType || "").toUpperCase() === "DEMERGER",
+  );
+
+  // Base table has 11 columns; each optional corporate-action date adds one.
+  const tableColSpan =
+    11 + (showMergerDate ? 1 : 0) + (showDemergerDate ? 1 : 0);
+
   return (
     <div className="hd-overlay">
       <div className="hd-container">
@@ -176,6 +186,7 @@ function TransactionPage({ stock, accountCode, asOnDate, onClose }) {
                   <th>Transaction Date</th>
                   <th>Settlement Date</th>
                   {showMergerDate && <th>Merger Date</th>}
+                  {showDemergerDate && <th>Demerger Date</th>}
                   <th>Type</th>
                   <th>ISIN</th>
                   <th>Quantity</th>
@@ -191,7 +202,7 @@ function TransactionPage({ stock, accountCode, asOnDate, onClose }) {
                 {transactions.length === 0 ? (
                   <tr>
                     <td
-                      colSpan={showMergerDate ? 12 : 11}
+                      colSpan={tableColSpan}
                       style={{
                         textAlign: "center",
                         padding: "40px",
@@ -207,12 +218,14 @@ function TransactionPage({ stock, accountCode, asOnDate, onClose }) {
                       <td>{tx.originalTrandate || tx.trandate || "-"}</td>
                       <td>{tx.setdate || "-"}</td>
                       {showMergerDate && <td>{tx.caDate || "-"}</td>}
+                      {showDemergerDate && <td>{tx.caDate || "-"}</td>}
                       <td>{tx.tranType || "-"}</td>
                       <td>{tx.isin || "-"}</td>
                       <td>
                         {formatQuantity(tx.qty)}
                         <span>
-                          {tx.tranType === "BY-" && tx.isActive == false
+                          {/^BY-|SQB|OPI/i.test(String(tx.tranType || "")) &&
+                          tx.isActive === false
                             ? "Inactive"
                             : ""}
                         </span>

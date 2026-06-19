@@ -14,9 +14,10 @@ async function queueRebuildHoldingsJobs(catalystApp, accountCodes, source, isins
 
   /* Scope the rebuild to the ISIN(s) this merger touched. Without this the
      downstream RebuildHoldingtable re-derives EVERY ISIN for EVERY account,
-     which blows past the 15-min Catalyst timeout once the book is large. */
+     which blows past the 15-min Catalyst timeout once the book is large.
+     Keep the exact ISIN case the apply used so the scoped rebuild matches. */
   const scopedIsins = [...new Set(isins || [])]
-    .map((i) => String(i || "").trim().toUpperCase())
+    .map((i) => String(i || "").trim())
     .filter(Boolean);
 
   const scheduling = catalystApp.jobScheduling();

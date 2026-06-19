@@ -1,7 +1,7 @@
 import Express from "express";
 const app = Express();
 const port = process.env.X_ZOHO_CATALYST_LISTEN_PORT || 9000;
-import cors from "cors";
+// import cors from "cors";
 
 import AnalyticsRouter from "./router/AnalyticsRouter.js";
 import TransactionsRouter from "./router/TransactionRouter.js";
@@ -20,14 +20,15 @@ import MergerRouter from "./router/MergerRouter.js";
 import ClientRouter from "./router/clientRouter/ClientRouter.js";
 import SecurityRouter from "./router/securityRouter/SecurityRouter.js";
 
-app.use(
-  cors({
-    origin: "http://localhost:3000",
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  }),
-);
+// app.use(
+//   cors({
+//     origin: "http://localhost:3000",
+//     credentials: true,
+//     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+//     allowedHeaders: ["Content-Type", "Authorization"],
+//   }),
+// );
+
 app.use(Express.json());
 app.use(Express.urlencoded({ extended: true }));
 
@@ -71,71 +72,17 @@ app.use("/api/security", SecurityRouter);
 // Fill each row with account codes. One job is triggered per row, 10 at a time.
 const accounts = [
   [
-    "SVAYAN009",
-    "SVAYAN010",
-    "SVAYAN011",
-    "SVAYAN012",
-    "SVAYAN013",
-    "SVAYAN014",
-    "TAYAN001",
-    "TAYAN002",
-    "TAYAN003",
-    "TAYAN004",
+    // "AYAN126",
+    // "AYAN111",
+    // "AYAN064",
+    // "AYAN066",
+    // "AYAN067",
+    "AYAN037",
+    "AYAN039",
+    "AYAN040",
+    "AYAN023",
+    "AYAN021",
   ],
-
-  [
-    "TAYAN005",
-    "TAYAN006",
-    "TAYAN007",
-    "TAYAN008",
-    "TAYAN009",
-    "TAYAN010",
-    "TAYAN011",
-    "TAYAN012",
-    "TAYAN013",
-    "TAYAN014",
-  ],
-
-  [
-    "TAYAN015",
-    "TAYAN016",
-    "TAYAN017",
-    "TAYAN018",
-    "TAYAN019",
-    "TAYAN020",
-    "TAYAN021",
-    "TAYAN022",
-    "TAYAN023",
-    "TAYAN024",
-  ],
-
-  [
-    "TAYAN025",
-    "TAYAN026",
-    "TAYAN027",
-    "TAYAN028",
-    "TAYAN029",
-    "TAYAN030",
-    "TAYAN031",
-    "TAYAN032",
-    "TAYAN033",
-    "TMAYAN001",
-  ],
-
-  [
-    "TMAYAN002",
-    "TMAYAN003",
-    "TMAYAN004",
-    "TMAYAN005",
-    "TMAYAN006",
-    "TMAYAN007",
-    "TMAYAN008",
-    "TMAYAN009",
-    "TMAYAN010",
-    "TMAYAN011",
-  ],
-
-  ["TMAYAN012", "TMNRE01", "TMNRE02", "TMNRE04", "WAYAN01", "WAYAN02"],
 ];
 
 // Hit this route to manually trigger the holding update jobs.

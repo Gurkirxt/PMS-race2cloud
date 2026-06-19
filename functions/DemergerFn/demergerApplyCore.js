@@ -185,18 +185,19 @@ function computeSurvivingLotsFromHoldingRows(rows) {
     const qty = Number(row.QUANTITY || 0);
     const price = Number(row.PRICE || 0);
     const buyDate = row.TRANSACTION_DATE || row.SETTLEMENT_DATE || null;
+    const setDate = row.SETTLEMENT_DATE || row.TRANSACTION_DATE || null;
     const sourceRowId = String(row.ROWID || "");
 
     if (isBuyType(type)) {
       if (qty > 0) {
-        queue.push({ qty, price, buyDate, sourceRowId, sourceType: type });
+        queue.push({ qty, price, buyDate, setDate, sourceRowId, sourceType: type });
       }
       continue;
     }
 
     if (upperEq(type, "BONUS")) {
       if (qty > 0) {
-        queue.push({ qty, price: 0, buyDate, sourceRowId, sourceType: "BONUS" });
+        queue.push({ qty, price: 0, buyDate, setDate, sourceRowId, sourceType: "BONUS" });
       }
       continue;
     }
@@ -220,7 +221,7 @@ function computeSurvivingLotsFromHoldingRows(rows) {
         lastReplaceEventKey = eventKey;
       }
       if (qty > 0) {
-        queue.push({ qty, price, buyDate, sourceRowId, sourceType: type });
+        queue.push({ qty, price, buyDate, setDate, sourceRowId, sourceType: type });
       }
       continue;
     }
@@ -258,6 +259,7 @@ function buildLotLevelDemergerForAccount({
       oldIsin,
       sourceLotRowId: lot.sourceRowId,
       sourceLotDate: lot.buyDate,
+      sourceLotSetDate: lot.setDate,
       sourceLotType: lot.sourceType,
       oldQty: Q1,
       oldWapBefore: round(lotPrice, 4),
@@ -381,20 +383,31 @@ async function runDemergerApply(zcql, opts) {
           ? `'${esc(lr.sourceLotRowId)}'`
           : "NULL";
 
+        // Preserve the original lot's trade date on the demerger rows (old +
+        // new ISIN); only the Tran_Type becomes DEMERGER. The corporate-action
+        // record date is stored separately in Record_Date (→ Holdings.CA_DATE
+        // on rebuild), so FIFO ordering still anchors on the record date.
+        const lotTranDate =
+          String(lr.sourceLotDate || effectiveDateISO).slice(0, 10) ||
+          effectiveDateISO;
+        const lotSetDate =
+          String(lr.sourceLotSetDate || lr.sourceLotDate || effectiveDateISO).slice(0, 10) ||
+          effectiveDateISO;
+
         await zcql.executeZCQLQuery(`
           INSERT INTO Demerger_Record
           (WS_Account_code, TRANDATE, SETDATE, Tran_Type, ISIN,
            Security_Code, Security_Name,
            QTY, PRICE, TOTAL_AMOUNT, HOLDING, WAP, HOLDING_VALUE, PL,
-           Source_Tran_ROWID)
+           Source_Tran_ROWID, Record_Date)
           VALUES
-          ('${esc(accountCode)}', '${esc(effectiveDateISO)}', '${esc(effectiveDateISO)}', 'DEMERGER',
+          ('${esc(accountCode)}', '${esc(lotTranDate)}', '${esc(lotSetDate)}', 'DEMERGER',
            '${esc(oldIsin)}',
            '${esc(oldSecurityCode)}', '${esc(oldSecurityName)}',
            ${lr.oldQty}, ${lr.oldWapAfter}, ${lr.oldCostAfter},
            ${lr.oldQty}, ${lr.oldWapAfter}, ${lr.oldCostAfter},
            0,
-           ${sourceRowId})
+           ${sourceRowId}, '${esc(recordDateISO)}')
         `);
         lotRowsInserted++;
         affectedAccountsSet.add(accountCode);
@@ -405,15 +418,15 @@ async function runDemergerApply(zcql, opts) {
             (WS_Account_code, TRANDATE, SETDATE, Tran_Type, ISIN,
              Security_Code, Security_Name,
              QTY, PRICE, TOTAL_AMOUNT, HOLDING, WAP, HOLDING_VALUE, PL,
-             Source_Tran_ROWID)
+             Source_Tran_ROWID, Record_Date)
             VALUES
-            ('${esc(accountCode)}', '${esc(effectiveDateISO)}', '${esc(effectiveDateISO)}', 'DEMERGER',
+            ('${esc(accountCode)}', '${esc(lotTranDate)}', '${esc(lotSetDate)}', 'DEMERGER',
              '${esc(newIsin)}',
              '${esc(newSecurityCode)}', '${esc(newSecurityName)}',
              ${lr.newQty}, ${lr.newWap}, ${lr.newCost},
              ${lr.newQty}, ${lr.newWap}, ${lr.newCost},
              0,
-             ${sourceRowId})
+             ${sourceRowId}, '${esc(recordDateISO)}')
           `);
           lotRowsInserted++;
         }
