@@ -114,6 +114,7 @@ export const postUpdateIsin = async (req, res) => {
     const catalystApp = req.catalystApp;
 
     // Catalyst submitJob: job_name must be 1–20 characters (not the Stratus object key).
+    // This name also keys the Jobs status row the worker marks SUCCESS when done.
     const catalystJobName = `U${Date.now()}`.slice(0, 20);
 
     const submitted = await catalystApp.jobScheduling().JOB.submitJob({
@@ -125,6 +126,7 @@ export const postUpdateIsin = async (req, res) => {
         mode: "rename",
         old_isin: oldTrim,
         new_isin: newTrim,
+        status_key: catalystJobName,
       },
     });
 
@@ -242,11 +244,32 @@ export const getIsinUpdateJobStatus = async (req, res) => {
       });
     }
 
+    // Preferred: read the Jobs status row the worker maintains (jobName = the
+    // status_key returned by /update). The master job itself completes as soon
+    // as it dispatches the worker, so its native jobId is NOT the real status.
+    const jobNameRaw = req.query.jobName;
+    if (jobNameRaw != null && String(jobNameRaw).trim() !== "") {
+      const jobName = String(jobNameRaw).trim();
+      const rows = await req.catalystApp.zcql().executeZCQLQuery(`
+        SELECT status FROM Jobs WHERE jobName = '${escSql(jobName)}' LIMIT 1
+      `);
+      const st = String(rows?.[0]?.Jobs?.status ?? rows?.[0]?.status ?? "").toUpperCase();
+      let jobStatus;
+      if (["SUCCESS", "SUCCESSFUL", "COMPLETED", "COMPLETE"].includes(st)) {
+        jobStatus = "SUCCESSFUL";
+      } else if (["FAILURE", "FAILED", "ERROR"].includes(st)) {
+        jobStatus = "FAILURE";
+      } else {
+        jobStatus = st || "IN_PROGRESS";
+      }
+      return res.status(200).json({ success: true, jobName, jobStatus });
+    }
+
     const raw = req.query.jobId;
     if (raw == null || String(raw).trim() === "") {
       return res.status(400).json({
         success: false,
-        message: "Query parameter jobId is required.",
+        message: "Query parameter jobId or jobName is required.",
       });
     }
 

@@ -4,6 +4,7 @@ import {
   fetchVirtualCodesByActual,
   consolidateSummaries,
 } from "../../../util/analytics/consolidatedHoldings.js";
+import { reportTimestamp } from "../../../util/reportTimestamp.js";
 
 /**
  * GET /api/export/export-consolidated?actualCode=...&asOnDate=...
@@ -25,6 +26,8 @@ export const exportConsolidatedPerActual = async (req, res) => {
     }
 
     const reportDate = asOnDate || new Date().toISOString().split("T")[0];
+    // When this report was generated (IST), stamped on every row.
+    const generatedAt = reportTimestamp();
 
     const catalystApp = req.catalystApp;
     const zcql = catalystApp.zcql();
@@ -63,7 +66,7 @@ export const exportConsolidatedPerActual = async (req, res) => {
 
     /* ---------------- CSV HEADER (HOLDING ONLY) ---------------- */
     csvStream.write(
-      "AS_ON_DATE,ACCOUNT_CODE,SECURITY_NAME,SECURITY_CODE,ISIN,HOLDING\n",
+      "GENERATED_AT,AS_ON_DATE,ACCOUNT_CODE,SECURITY_NAME,SECURITY_CODE,ISIN,HOLDING\n",
     );
 
     if (!consolidated.length) {
@@ -77,6 +80,7 @@ export const exportConsolidatedPerActual = async (req, res) => {
     /* ---------------- WRITE ROWS ---------------- */
     for (const row of consolidated) {
       const line = [
+        generatedAt,
         reportDate,
         actualCode,
         row.stockName ?? "",
