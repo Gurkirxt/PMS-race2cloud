@@ -1,7 +1,11 @@
 const parseCatalystTime = (ct) => {
   if (!ct) return 0;
-  const fixed = ct.replace(/:(\d{3})$/, ".$1");
-  const ms = new Date(fixed).getTime();
+  // Catalyst CREATEDTIME is an IST (UTC+05:30) wall-clock string like
+  // "2026-06-19 17:41:28:675". Parse it explicitly as IST so the AppSail
+  // server's own timezone (UTC) doesn't shift it +5:30. Without the explicit
+  // offset the time renders 5.5h ahead in the UI after a refresh.
+  const iso = String(ct).trim().replace(" ", "T").replace(/:(\d{3})$/, ".$1");
+  const ms = new Date(`${iso}+05:30`).getTime();
   return isNaN(ms) ? 0 : ms;
 };
 

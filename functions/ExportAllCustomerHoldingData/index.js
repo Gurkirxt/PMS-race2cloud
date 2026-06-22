@@ -26,6 +26,12 @@ module.exports = async (jobRequest, context) => {
     // Report date stamped on every row. exportAllData always passes a concrete
     // asOnDate, but default to today defensively.
     const reportDate = asOnDate || new Date().toISOString().split("T")[0];
+    // When this report was generated (IST, UTC+5:30), stamped on every row.
+    const generatedAt =
+      new Date(Date.now() + 5.5 * 60 * 60 * 1000)
+        .toISOString()
+        .replace("T", " ")
+        .slice(0, 19) + " IST";
 
     const stratus = catalystApp.stratus();
     const bucket = stratus.bucket("upload-data-bucket");
@@ -56,7 +62,7 @@ module.exports = async (jobRequest, context) => {
       }
 
       csvLines.push(
-        "AS_ON_DATE,ACCOUNT_CODE,SECURITY_NAME,SECURITY_CODE,ISIN,HOLDING\n"
+        "GENERATED_AT,AS_ON_DATE,ACCOUNT_CODE,SECURITY_NAME,SECURITY_CODE,ISIN,HOLDING\n"
       );
 
       for (const group of groups) {
@@ -102,6 +108,7 @@ module.exports = async (jobRequest, context) => {
 
           for (const row of merged) {
             const line = [
+              generatedAt,
               reportDate,
               actualCode,
               row.stockName ?? "",
@@ -141,7 +148,7 @@ module.exports = async (jobRequest, context) => {
       }
 
       csvLines.push(
-        "AS_ON_DATE,ACCOUNT_CODE,SECURITY_NAME,SECURITY_CODE,ISIN,HOLDING,WAP,HOLDING_VALUE,LAST_PRICE,MARKET_VALUE\n"
+        "GENERATED_AT,AS_ON_DATE,ACCOUNT_CODE,SECURITY_NAME,SECURITY_CODE,ISIN,HOLDING,WAP,HOLDING_VALUE,LAST_PRICE,MARKET_VALUE\n"
       );
 
       for (const client of clientIds) {
@@ -166,6 +173,7 @@ module.exports = async (jobRequest, context) => {
 
           for (const row of rows) {
             const line = [
+              generatedAt,
               reportDate,
               accountCode,
               row.stockName ?? "",

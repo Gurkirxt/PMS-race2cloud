@@ -35,7 +35,8 @@
       "RebuildHoldingtable",
       "CalculateHoldingWorkers",
       "CalculateHoldingMaster",
-      "HoldingUpdateManually"
+      "HoldingUpdateManually",
+      "UpdateISINWorker"
     ],
     "ignore": [],
     "source": "functions"

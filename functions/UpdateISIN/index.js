@@ -1,11 +1,13 @@
 "use strict";
 
 /**
- * UpdateISIN (Catalyst job) — two modes
+ * UpdateISIN (Catalyst job) — master / orchestrator. Two modes.
  *
- *   mode = "rename" (default, params: old_isin, new_isin)
- *     Replaces old_isin with new_isin across every table in
- *     TABLES_WITH_ISIN_COLUMN. Per-table errors are logged and skipped.
+ *   mode = "rename" (default, params: old_isin, new_isin, status_key?)
+ *     Does NO renaming itself. It opens a Jobs status row and dispatches one
+ *     UpdateISINWorker job, which renames old_isin → new_isin across every
+ *     ISIN-bearing table in small, timeout-proof batches (and walks the
+ *     merger/demerger old + new ISIN columns). See UpdateISINWorker/index.js.
  *
  *   mode = "apply-new" (params: isin, security_code?, security_name?)
  *     Backs the "New ISIN" Apply panel. Syncs Security_Code / Security_Name
@@ -20,30 +22,39 @@ const catalyst = require("zcatalyst-sdk-node");
 
 const esc = (v) => String(v ?? "").replace(/'/g, "''");
 
-const TABLES_WITH_ISIN_COLUMN = [
-  "Security_List",
-  "Transaction",
-  "Bonus",
-  "Bonus_Record",
-  "Split",
-  "Dividend",
-  "Temp_Transaction",
-  "Temp_Custodian",
-  "Bhav_Copy",
-  "Cash_Balance_Per_Transaction",
-  "Holdings",
-];
+/** Worker that performs the batched rename, and the pool it runs in. */
+const WORKER_TARGET = "UpdateISINWorker";
+const WORKER_JOBPOOL = "UpdateMasters";
 
 const NEW_ISIN_TARGETS = [
   { table: "Security_List", codeCol: "Security_Code", nameCol: "Security_Name" },
   { table: "Transaction", codeCol: "Security_code", nameCol: "Security_Name" },
 ];
 
-async function runRenameMode(zcql, params) {
+/** Open (or reset) the Jobs row the worker marks SUCCESS when the rename finishes. */
+async function ensureJobsRowRunning(zcql, jobName) {
+  if (!jobName) return;
+  try {
+    await zcql.executeZCQLQuery(
+      `INSERT INTO Jobs (jobName, status) VALUES ('${esc(jobName)}', 'RUNNING')`,
+    );
+  } catch (insertErr) {
+    try {
+      await zcql.executeZCQLQuery(
+        `UPDATE Jobs SET status = 'RUNNING' WHERE jobName = '${esc(jobName)}'`,
+      );
+    } catch (upErr) {
+      console.warn(`[UpdateISIN] ensure Jobs RUNNING failed for ${jobName}:`, upErr.message);
+    }
+  }
+}
+
+async function runRenameMode(app, zcql, params) {
   const oldIsin = String(params.old_isin ?? "").trim();
   const newIsin = String(params.new_isin ?? "").trim();
+  const statusKey = String(params.status_key ?? "").trim();
 
-  console.log(`[UpdateISIN/rename] Started: "${oldIsin}" → "${newIsin}"`);
+  console.log(`[UpdateISIN/rename] Dispatching worker: "${oldIsin}" → "${newIsin}"`);
 
   if (!oldIsin || !newIsin) {
     throw new Error("Parameters old_isin and new_isin are required for rename mode");
@@ -52,21 +63,24 @@ async function runRenameMode(zcql, params) {
     throw new Error("Old and new ISIN must differ");
   }
 
-  const oldSql = esc(oldIsin);
-  const newSql = esc(newIsin);
+  await ensureJobsRowRunning(zcql, statusKey);
 
-  for (const table of TABLES_WITH_ISIN_COLUMN) {
-    try {
-      await zcql.executeZCQLQuery(
-        `UPDATE ${table} SET ISIN = '${newSql}' WHERE ISIN = '${oldSql}'`
-      );
-      console.log(`[UpdateISIN/rename] Updated table: ${table}`);
-    } catch (tableErr) {
-      console.warn(`[UpdateISIN/rename] Skipped table "${table}":`, tableErr?.message);
-    }
-  }
+  const workerJobName = `IW0_${Date.now()}`.slice(0, 20);
+  await app.jobScheduling().JOB.submitJob({
+    job_name: workerJobName,
+    jobpool_name: WORKER_JOBPOOL,
+    target_name: WORKER_TARGET,
+    target_type: "Function",
+    job_config: { number_of_retries: 5, retry_interval: 60 * 1000 },
+    params: {
+      old_isin: oldIsin,
+      new_isin: newIsin,
+      status_key: statusKey,
+      target_index: "0",
+    },
+  });
 
-  console.log(`[UpdateISIN/rename] Done: "${oldIsin}" → "${newIsin}"`);
+  console.log(`[UpdateISIN/rename] Worker queued (${workerJobName}) for "${oldIsin}" → "${newIsin}"`);
 }
 
 async function countRowsToSync(zcql, table, col, isin, newVal) {
@@ -155,7 +169,7 @@ module.exports = async (jobRequest, context) => {
     const mode = String(params.mode ?? "rename").trim();
 
     if (mode === "rename") {
-      await runRenameMode(zcql, params);
+      await runRenameMode(catalystApp, zcql, params);
     } else if (mode === "apply-new") {
       await runApplyNewMode(zcql, params);
     } else {
