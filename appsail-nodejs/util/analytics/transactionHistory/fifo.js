@@ -13,6 +13,19 @@ const EVENT_TYPE_PRIORITY = {
   MERGER: 4,
 };
 
+/**
+ * Quantity epsilon for normal (non-corporate-action) FIFO math. Snaps tiny
+ * floating-point residue (e.g. 0.533 - 0.533 = 1e-16) to exactly zero so
+ * fully-sold positions end at 0 and consumed lots leave the queue. Genuine
+ * fractional quantities (e.g. 5.533) are preserved. Corporate-action rounding
+ * (Math.floor / ratio logic) is intentional and unaffected.
+ */
+const QTY_EPS = 1e-6;
+const snapQty = (n) => {
+  const v = Number(n) || 0;
+  return Math.abs(v) < QTY_EPS ? 0 : v;
+};
+
 export const runFifoEngine = (
   transactions = [],
   bonuses = [],
@@ -230,13 +243,13 @@ export const runFifoEngine = (
           lot.qty -= used;
           remaining -= used;
 
-          if (lot.qty === 0) {
+          if (snapQty(lot.qty) === 0) {
             lot.isActive = false; // 🔥 mark inactive
             buyQueue.shift();
           }
         }
 
-        holdings -= sellQty;
+        holdings = snapQty(holdings - sellQty);
 
         output.push({
           trandate: t.trandate,

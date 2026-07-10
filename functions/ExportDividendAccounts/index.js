@@ -148,7 +148,7 @@ module.exports = async (jobRequest, context) => {
       const bonuses = bonusByAcc[accountCode] || [];
 
       const fifo = runFifoEngine(tx, bonuses, splits, true);
-      if (!fifo || fifo.holdings <= 0) continue;
+      if (!fifo || fifo.holdings <= 1e-6) continue;
 
       const holdingAsOnRecordDate = fifo.holdings;
       const dividendAmount = holdingAsOnRecordDate * rateNum;

@@ -193,7 +193,8 @@ export function rollupLastSnapshotByIsin(sortedHoldingsRows) {
   const out = [];
   for (const [isin, row] of lastByIsin) {
     const hold = Number(row.HOLDING) || 0;
-    if (hold <= 0) continue;
+    // Treat sub-epsilon dust as a closed position (fully sold), not an open one.
+    if (hold <= 1e-6) continue;
     out.push({
       isin,
       lastRow: row,

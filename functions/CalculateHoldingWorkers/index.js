@@ -55,6 +55,21 @@ const BATCH = 250;
 
 const esc = (s) => String(s ?? "").replace(/'/g, "''");
 
+/**
+ * Quantity epsilon for normal (non-corporate-action) FIFO math. Floating point
+ * subtraction on fractional share quantities can leave tiny residue (e.g.
+ * 0.533 - 0.533 = 1e-16) which would otherwise linger in the buy queue and
+ * drift the running holding. snapQty() treats anything below QTY_EPS as exactly
+ * zero. Genuine fractional quantities (e.g. 5.533) are preserved untouched.
+ * Corporate-action rounding (Math.floor on demerger/merger, split/bonus ratios)
+ * is intentional business logic and is NOT affected by this.
+ */
+const QTY_EPS = 1e-6;
+const snapQty = (n) => {
+  const v = Number(n) || 0;
+  return Math.abs(v) < QTY_EPS ? 0 : v;
+};
+
 /** When tracking is enabled, written to JobStatusPerAccount.jobType unless params.jobType overrides. */
 const HOLDINGS_JOB_TYPE_DEFAULT = "HOLDINGS_FULL_REBUILD";
 
@@ -500,12 +515,12 @@ function reconstructBuyQueueFromHoldings(rows) {
         const used = Math.min(lot.qty, remaining);
         lot.qty -= used;
         remaining -= used;
-        if (lot.qty === 0) queue.shift();
+        if (snapQty(lot.qty) === 0) queue.shift();
       }
     }
   }
 
-  const holding = queue.reduce((s, l) => s + l.qty, 0);
+  const holding = snapQty(queue.reduce((s, l) => s + l.qty, 0));
   const cost = queue.reduce((s, l) => s + l.qty * l.price, 0);
   return { queue, holding, cost };
 }
@@ -680,10 +695,11 @@ async function appendTxnsWithQueueReconstruct(
         fifoCost += used * lot.price;
         lot.qty -= used;
         remaining -= used;
-        if (lot.qty === 0) queue.shift();
+        if (snapQty(lot.qty) === 0) queue.shift();
       }
-      holding -= sellQty;
+      holding = snapQty(holding - sellQty);
       cost -= fifoCost;
+      if (holding === 0) cost = 0;
       profitLoss = sellQty * price - fifoCost;
       isActive = false;
     } else {

@@ -133,7 +133,7 @@ export const exportSplitPreviewFile = async (req, res) => {
       const bonuses = bonusByAcc[acc] || [];
 
       const before = runFifoEngine(tx, bonuses, pastSplits, true);
-      if (!before || before.holdings <= 0) continue;
+      if (!before || before.holdings <= 1e-6) continue;
 
       const newHolding = Math.floor(before.holdings * splitMultiplier);
       const delta = newHolding - before.holdings;

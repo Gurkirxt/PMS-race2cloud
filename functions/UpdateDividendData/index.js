@@ -29,6 +29,18 @@ const ZCQL_ROW_LIMIT = 270;
 
 const esc = (s) => String(s ?? "").replace(/'/g, "''");
 
+/**
+ * Quantity epsilon for normal (non-corporate-action) FIFO math. Snaps tiny
+ * floating-point residue to exactly zero so fully-sold positions end at 0 and
+ * consumed lots leave the queue. Genuine fractional quantities are preserved.
+ * Corporate-action rounding is intentional and unaffected.
+ */
+const QTY_EPS = 1e-6;
+const snapQty = (n) => {
+  const v = Number(n) || 0;
+  return Math.abs(v) < QTY_EPS ? 0 : v;
+};
+
 const normalizeDate = (d) => {
   const dt = new Date(d);
   dt.setUTCHours(0, 0, 0, 0);
@@ -247,12 +259,12 @@ function runFifoEngine(
           fifoCost += used * lot.price;
           lot.qty -= used;
           remaining -= used;
-          if (lot.qty === 0) {
+          if (snapQty(lot.qty) === 0) {
             lot.isActive = false;
             buyQueue.shift();
           }
         }
-        holdings -= sellQty;
+        holdings = snapQty(holdings - sellQty);
         output.push({
           trandate: t.trandate,
           originalTrandate: t.originalTrandate,
@@ -781,7 +793,7 @@ module.exports = async (jobRequest, context) => {
 
       const bonuses = bonusByAccount[accountCode] || [];
       const fifo = runFifoEngine(transactions, bonuses, splits, true);
-      if (!fifo || fifo.holdings <= 0) {
+      if (!fifo || fifo.holdings <= 1e-6) {
         skippedFlat++;
         continue;
       }

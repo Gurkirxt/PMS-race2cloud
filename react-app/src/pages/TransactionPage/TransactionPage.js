@@ -98,10 +98,21 @@ function TransactionPage({ stock, accountCode, asOnDate, onClose }) {
     return num.toLocaleString("en-IN");
   };
 
-  const formatQuantity = (value) => {
+  // Corporate actions intentionally round share counts (Math.floor on
+  // demerger/merger ratios, whole bonus/split shares), so their quantities are
+  // shown as whole numbers. Normal transactions (OPI, SL+, BY-, SQB, ...) can
+  // legitimately be fractional and must be displayed with their real decimals.
+  const CA_TYPES = ["BONUS", "SPLIT", "MERGER", "DEMERGER", "RIGHTS"];
+  const isCorporateAction = (type) =>
+    CA_TYPES.includes(String(type || "").toUpperCase());
+
+  const formatQuantity = (value, type) => {
     const num = Number(value);
     if (value === null || value === undefined || value === "" || isNaN(num)) return "-";
-    return Math.floor(num).toLocaleString("en-IN");
+    const snapped = Math.abs(num) < 1e-6 ? 0 : num;
+    return isCorporateAction(type)
+      ? Math.floor(snapped).toLocaleString("en-IN")
+      : snapped.toLocaleString("en-IN", { maximumFractionDigits: 3 });
   };
 
   const lastTransaction = transactions[transactions.length - 1];
@@ -222,7 +233,7 @@ function TransactionPage({ stock, accountCode, asOnDate, onClose }) {
                       <td>{tx.tranType || "-"}</td>
                       <td>{tx.isin || "-"}</td>
                       <td>
-                        {formatQuantity(tx.qty)}
+                        {formatQuantity(tx.qty, tx.tranType)}
                         <span>
                           {/^BY-|SQB|OPI/i.test(String(tx.tranType || "")) &&
                           tx.isActive === false
@@ -232,7 +243,7 @@ function TransactionPage({ stock, accountCode, asOnDate, onClose }) {
                       </td>
                       <td>{Math.trunc(tx.price * 100) / 100}</td>
                       <td>{formatCurrency(tx.netAmount)}</td>
-                      <td>{formatQuantity(tx.holdings)}</td>
+                      <td>{formatQuantity(tx.holdings, tx.tranType)}</td>
                       <td>
                         {Math.trunc(tx.averageCostOfHoldings * 100) / 100}
                       </td>

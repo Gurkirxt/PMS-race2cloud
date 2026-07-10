@@ -361,7 +361,7 @@ module.exports = async (jobRequest, context) => {
         );
 
         const fifo = runFifoEngine(tx, bonuses, splits, true);
-        if (!fifo || fifo.holdings <= 0) {
+        if (!fifo || fifo.holdings <= 1e-6) {
           if (trackingOn) await markAccountSuccess(zcql, jobName, accountCode);
           continue;
         }

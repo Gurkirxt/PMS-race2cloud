@@ -1,0 +1,35 @@
+---
+description: Keep PMS-race2cloud/README.md in sync whenever code or architecture changes
+alwaysApply: true
+---
+
+# Update README on Every Change
+
+When you modify this project (`PMS-race2cloud/`), also update `PMS-race2cloud/README.md` in the same task.
+
+## When to update README
+
+Update the relevant README section(s) whenever you change:
+
+- `appsail-nodejs/` — API routes, controllers, business logic, job triggers
+- `react-app/` — routes, pages, API integration, UI flows
+- `functions/` — Catalyst jobs, pipelines, tables, helpers
+- `catalyst.json` — deploy targets or function list
+- Architecture, workflows, data models, or known limitations
+
+## What to update
+
+- Keep docs accurate to the code — do not leave stale endpoints, flows, or file counts.
+- Match the existing README structure (Backend, Frontend, Catalyst Functions, workflows, limitations).
+- Scope README edits to what changed; avoid unrelated rewrites.
+
+## When README-only updates are enough
+
+If the user asks only for documentation, updating `README.md` alone is fine.
+
+## Skip README updates only when
+
+- The change is trivial and non-behavioral (e.g. typo in a comment with no functional impact), **or**
+- The user explicitly says not to update the README.
+
+Default: **always update README** when making meaningful project changes.

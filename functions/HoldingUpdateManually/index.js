@@ -25,6 +25,18 @@ const DRY_RUN = false;
 
 const esc = (s) => String(s ?? "").replace(/'/g, "''");
 
+/**
+ * Quantity epsilon for normal (non-corporate-action) FIFO math. Snaps tiny
+ * floating-point residue to exactly zero so fully-sold positions end at 0 and
+ * consumed lots leave the queue. Genuine fractional quantities are preserved.
+ * Corporate-action rounding is intentional and unaffected.
+ */
+const QTY_EPS = 1e-6;
+const snapQty = (n) => {
+  const v = Number(n) || 0;
+  return Math.abs(v) < QTY_EPS ? 0 : v;
+};
+
 const sqlDate = (v) => {
   const s = String(v ?? "").trim().slice(0, 10);
   return s && /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : "";
@@ -444,9 +456,9 @@ function runFifoEngine(
           fifoCost += used * lot.price;
           lot.qty -= used;
           remaining -= used;
-          if (lot.qty === 0) { lot.isActive = false; buyQueue.shift(); }
+          if (snapQty(lot.qty) === 0) { lot.isActive = false; buyQueue.shift(); }
         }
-        holdings -= sellQty;
+        holdings = snapQty(holdings - sellQty);
         output.push({
           trandate: t.trandate, originalTrandate: t.originalTrandate,
           setdate: t.setdate, tranType: t.tranType, qty, price, netAmount: t.netAmount,

@@ -152,10 +152,20 @@ const TransactionTab = ({ accountCode, asOnDate }) => {
       ? "-"
       : Number(v).toLocaleString("en-IN", { maximumFractionDigits: 2 });
 
-  const formatQuantity = (v) =>
-    v === null || v === undefined || Number.isNaN(Number(v))
-      ? "-"
-      : Math.floor(Number(v)).toLocaleString("en-IN");
+  // Corporate actions round share counts (intentional); normal transactions
+  // can be fractional and must display their real decimals.
+  const CA_TYPES = ["BONUS", "SPLIT", "MERGER", "DEMERGER", "RIGHTS"];
+  const isCorporateAction = (type) =>
+    CA_TYPES.includes(String(type || "").toUpperCase());
+
+  const formatQuantity = (v, type) => {
+    if (v === null || v === undefined || Number.isNaN(Number(v))) return "-";
+    const num = Number(v);
+    const snapped = Math.abs(num) < 1e-6 ? 0 : num;
+    return isCorporateAction(type)
+      ? Math.floor(snapped).toLocaleString("en-IN")
+      : snapped.toLocaleString("en-IN", { maximumFractionDigits: 3 });
+  };
 
   return (
     <Card>
@@ -272,7 +282,7 @@ const TransactionTab = ({ accountCode, asOnDate }) => {
                     <td>{t.type || "-"}</td>
                     <td>{t.securityName || "-"}</td>
                     <td>{t.isin || "-"}</td>
-                    <td className="num">{formatQuantity(t.quantity)}</td>
+                    <td className="num">{formatQuantity(t.quantity, t.type)}</td>
                     <td className="num">{formatNumber(t.price)}</td>
                     <td className="num">{formatNumber(t.totalAmount)}</td>
                   </tr>

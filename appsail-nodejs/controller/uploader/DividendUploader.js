@@ -415,7 +415,7 @@ export const getAllSecuritiesISINs = async (req, res) => {
         const bonuses = bonusByAccount[accountCode] || [];
 
         const fifo = runFifoEngine(transactions, bonuses, splits, true);
-        if (!fifo || fifo.holdings <= 0) continue;
+        if (!fifo || fifo.holdings <= 1e-6) continue;
 
         const holdingAsOnRecordDate = fifo.holdings;
         const dividendAmount = round2(holdingAsOnRecordDate * rateNum);

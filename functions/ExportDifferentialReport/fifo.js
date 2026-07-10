@@ -1,6 +1,18 @@
 "use strict";
 
 /**
+ * Quantity epsilon for normal (non-corporate-action) holding math. Snaps tiny
+ * floating-point residue to exactly zero so fully-sold positions report 0.
+ * Genuine fractional quantities are preserved. Corporate-action rounding is
+ * intentional and unaffected.
+ */
+const QTY_EPS = 1e-6;
+const snapQty = (n) => {
+  const v = Number(n) || 0;
+  return Math.abs(v) < QTY_EPS ? 0 : v;
+};
+
+/**
  * runFifoEngine
  *
  * @param {Array}   transactions  - Array of transaction rows
@@ -76,6 +88,9 @@ function runFifoEngine(transactions, bonuses, splits, returnHoldingsOnly = false
 
   // Holdings can never go below zero
   if (holdings < 0) holdings = 0;
+
+  // Snap floating-point dust from fractional buys/sells to exactly zero.
+  holdings = snapQty(holdings);
 
   return {
     isin: activeIsin,

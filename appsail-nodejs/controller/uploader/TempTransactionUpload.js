@@ -9,8 +9,8 @@ const TABLE_NAME = "Transaction";
 /** AppSail public base URL — used as the bulk-write callback target. */
 const APPSAIL_BASE_URL =
   process.env.CATALYST_APPSAIL_URL ||
-  // "https://backend-50039746698.development.catalystappsail.in";
-  "http://localhost:3001"
+  "https://backend-50039746698.development.catalystappsail.in";
+  // "http://localhost:3001";
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -752,7 +752,7 @@ export const uploadTempTransaction = async (req, res) => {
  * completes (success or failure). We return 200 immediately so Catalyst
  * does not retry the callback, then queue the downstream jobs.
  *
- * Downstream jobs triggered on COMPLETED:
+ * Downstream jobs triggered on COMPLETED / SUCCESS:
  *   - UpdatesSecurity_ClientMasters
  *   - CalculateHoldingMaster  (only when hasPairs = "true")
  *   - Cal_CB_Append_TxnUpload (only when hasPairs = "true")
@@ -812,13 +812,16 @@ export const handleBulkCallback = async (req, res) => {
       return;
     }
 
-    if (status !== "COMPLETED") {
-      // Unexpected status (e.g. RUNNING sent mid-job) — ignore.
+    const isBulkSuccess =
+      status === "COMPLETED" || status === "SUCCESS" || status === "SUCCESSFUL";
+
+    if (!isBulkSuccess) {
+      // Unexpected status (e.g. RUNNING, IN-PROGRESS) — ignore.
       console.warn(`[BulkCallback] Unexpected status "${status}" — ignoring.`);
       return;
     }
 
-    // ── COMPLETED ──────────────────────────────────────────────────
+    // ── Success / COMPLETED ──────────────────────────────────────
     if (pipelineJobName) {
       await updateJobsStatus(zcql, pipelineJobName, "COMPLETED");
     }

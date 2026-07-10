@@ -32,10 +32,13 @@ function HoldingsGrid({ holdings = [], onSelectStock }) {
     });
   };
 
+  // Current holding is the net outcome of normal buys/sells and can be
+  // fractional (e.g. 5.533). Show real decimals; snap sub-epsilon dust to 0.
   const formatQuantity = (value) => {
     const n = Number(value);
     if (!Number.isFinite(n)) return "—";
-    return Math.floor(n).toLocaleString("en-IN");
+    const snapped = Math.abs(n) < 1e-6 ? 0 : n;
+    return snapped.toLocaleString("en-IN", { maximumFractionDigits: 3 });
   };
 
   return (

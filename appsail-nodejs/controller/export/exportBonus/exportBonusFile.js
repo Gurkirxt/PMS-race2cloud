@@ -117,7 +117,7 @@ export const exportBonusPreviewFile = async (req, res) => {
 
       const bonuses = bonusByAcc[acc] || [];
       const before = runFifoEngine(tx, bonuses, splits, true);
-      if (!before || before.holdings <= 0) continue;
+      if (!before || before.holdings <= 1e-6) continue;
 
       const bonusShares = Math.floor((before.holdings * r1) / r2);
       if (bonusShares <= 0) continue;
