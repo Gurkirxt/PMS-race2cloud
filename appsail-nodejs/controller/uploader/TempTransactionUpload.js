@@ -67,6 +67,214 @@ async function updateJobsStatus(zcql, jobName, status) {
   }
 }
 
+/** Bulk-write status poll: first check after upload response, then every 30s, max 45 min. */
+const POLL_INITIAL_DELAY_MS = 15_000;
+const POLL_INTERVAL_MS = 30_000;
+const POLL_MAX_WAIT_MS = 45 * 60 * 1000;
+
+/** Pause between each downstream job submit to reduce Dev COMPONENT concurrency burst. */
+const JOB_DISPATCH_DELAY_MS = 10_000;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function normalizeBulkStatus(raw) {
+  return String(raw ?? "")
+    .toUpperCase()
+    .replace(/-/g, "_");
+}
+
+function isBulkSuccessStatus(status) {
+  const s = normalizeBulkStatus(status);
+  return s === "COMPLETED" || s === "SUCCESS" || s === "SUCCESSFUL";
+}
+
+function isBulkFailedStatus(status) {
+  return normalizeBulkStatus(status) === "FAILED";
+}
+
+function isBulkInProgressStatus(status) {
+  const s = normalizeBulkStatus(status);
+  return (
+    s === "IN_PROGRESS" || s === "RUNNING" || s === "PENDING" || s === "QUEUED"
+  );
+}
+
+async function getPipelineJobStatus(zcql, pipelineJobName) {
+  if (!pipelineJobName) return "";
+  try {
+    const rows = await zcql.executeZCQLQuery(`
+      SELECT status FROM Jobs
+      WHERE jobName = '${escSql(pipelineJobName)}'
+      LIMIT 1
+    `);
+    const row = rows?.[0]?.Jobs || rows?.[0];
+    return String(row?.status ?? "").trim().toUpperCase();
+  } catch (e) {
+    console.warn(`[TxnUploadPipeline] Jobs read failed:`, e.message);
+    return "";
+  }
+}
+
+async function failTxnUploadPipeline(catalystApp, pipelineJobName, reason) {
+  console.error(`[TxnUploadPipeline] FAILED: ${reason}`);
+  if (!pipelineJobName) return;
+  await updateJobsStatus(catalystApp.zcql(), pipelineJobName, "FAILED");
+}
+
+/**
+ * Queue security master + holdings + cash after bulk import succeeds.
+ * Idempotent: skips if Jobs row is no longer RUNNING (callback + poll safe).
+ */
+async function completeTxnUploadPipeline(catalystApp, meta, logPrefix = "[TxnUploadPipeline]") {
+  const {
+    pipelineJobName,
+    holdingsPairsKey,
+    bucketName,
+    importStartedAtMs,
+    objectKey,
+    hasPairs,
+  } = meta;
+
+  const zcql = catalystApp.zcql();
+  const current = await getPipelineJobStatus(zcql, pipelineJobName);
+
+  if (current && current !== "RUNNING") {
+    console.log(
+      `${logPrefix} skip — ${pipelineJobName} already ${current} (idempotent)`,
+    );
+    return;
+  }
+
+  if (pipelineJobName) {
+    await updateJobsStatus(zcql, pipelineJobName, "COMPLETED");
+  }
+
+  const jobScheduling = catalystApp.jobScheduling();
+
+  try {
+    await jobScheduling.JOB.submitJob({
+      job_name: `USCM_${Date.now()}`.slice(0, 20),
+      jobpool_name: "UpdateMasters",
+      target_name: "UpdatesSecurity_ClientMasters",
+      target_type: "Function",
+      job_config: { number_of_retries: 5, retry_interval: 60 * 1000 },
+      params: { source: "TxnUpload", bucketName, objectKey },
+    });
+    console.log(`${logPrefix} Queued UpdatesSecurity_ClientMasters.`);
+  } catch (err) {
+    console.error(
+      `${logPrefix} Failed to queue UpdatesSecurity_ClientMasters:`,
+      err.message,
+    );
+  }
+
+  if (!hasPairs) {
+    console.warn(`${logPrefix} No pairs — skipping Holdings and Cash jobs.`);
+    return;
+  }
+
+  console.log(
+    `${logPrefix} waiting ${JOB_DISPATCH_DELAY_MS}ms before CalculateHoldingMaster`,
+  );
+  await sleep(JOB_DISPATCH_DELAY_MS);
+
+  try {
+    await jobScheduling.JOB.submitJob({
+      job_name: `CHM_${Date.now()}`.slice(0, 20),
+      jobpool_name: "UpdateMasters",
+      target_name: "CalculateHoldingMaster",
+      target_type: "Function",
+      job_config: { number_of_retries: 5, retry_interval: 60 * 1000 },
+      params: {
+        source: "TxnUpload",
+        pairsObjectKey: holdingsPairsKey,
+        bucketName,
+        importStartedAtMs,
+      },
+    });
+    console.log(`${logPrefix} Queued CalculateHoldingMaster.`);
+  } catch (err) {
+    console.error(
+      `${logPrefix} Failed to queue CalculateHoldingMaster:`,
+      err.message,
+    );
+  }
+
+  console.log(
+    `${logPrefix} waiting ${JOB_DISPATCH_DELAY_MS}ms before Cal_CB_Append_TxnUpload`,
+  );
+  await sleep(JOB_DISPATCH_DELAY_MS);
+
+  try {
+    await jobScheduling.JOB.submitJob({
+      job_name: `CCB_${Date.now()}`.slice(0, 20),
+      jobpool_name: "UpdateMasters",
+      target_name: "Cal_CB_Append_TxnUpload",
+      target_type: "Function",
+      job_config: { number_of_retries: 5, retry_interval: 60 * 1000 },
+      params: {
+        source: "TxnUpload",
+        importStartedAtMs,
+        lastAccount: "",
+      },
+    });
+    console.log(`${logPrefix} Queued Cal_CB_Append_TxnUpload.`);
+  } catch (err) {
+    console.error(
+      `${logPrefix} Failed to queue Cal_CB_Append_TxnUpload:`,
+      err.message,
+    );
+  }
+}
+
+/** Poll Catalyst bulk-write job status when automatic callback is not delivered. */
+async function pollBulkWriteAndComplete(catalystApp, bulkJobId, meta) {
+  const logPrefix = `[BulkPoll ${bulkJobId}]`;
+  const bulkWrite = catalystApp.datastore().table(TABLE_NAME).bulkJob("write");
+  const start = Date.now();
+
+  console.log(
+    `${logPrefix} waiting ${POLL_INITIAL_DELAY_MS}ms before first status check`,
+  );
+  await sleep(POLL_INITIAL_DELAY_MS);
+
+  while (Date.now() - start < POLL_MAX_WAIT_MS) {
+    try {
+      const res = await bulkWrite.getStatus(bulkJobId);
+      const st = res?.status ?? res?.data?.status ?? "";
+      const norm = normalizeBulkStatus(st);
+
+      console.log(`${logPrefix} status=${norm}`);
+
+      if (isBulkSuccessStatus(st)) {
+        await completeTxnUploadPipeline(catalystApp, meta, logPrefix);
+        return;
+      }
+      if (isBulkFailedStatus(st)) {
+        await failTxnUploadPipeline(
+          catalystApp,
+          meta.pipelineJobName,
+          JSON.stringify(res),
+        );
+        return;
+      }
+      if (!isBulkInProgressStatus(st) && norm) {
+        console.warn(`${logPrefix} unexpected status ${norm} — keep polling`);
+      }
+    } catch (err) {
+      console.error(`${logPrefix} getStatus error:`, err.message);
+    }
+
+    await sleep(POLL_INTERVAL_MS);
+  }
+
+  await failTxnUploadPipeline(
+    catalystApp,
+    meta.pipelineJobName,
+    `timed out after ${POLL_MAX_WAIT_MS}ms`,
+  );
+}
+
 /**
  * Bank / broker export: row-1 headers — exact count (26), order, spelling, and case.
  * Three literal `filler` headers after BankRef match the broker file; first two map by position to NETRATE / Net_Amount.
@@ -476,9 +684,8 @@ function extractDistinctBrokerAccountIsinPairsFromCsv(fileBuffer) {
  * 4. Rewrites CSV: maps template headers to Transaction columns (HEADER_MAP), tab → comma, trim cells.
  * 5. Uploads rewritten CSV + original CSV to Stratus. Writes pairs JSON + account codes JSON to Stratus.
  * 6. Creates Datastore bulk write job (Transaction table) WITH a callback URL.
- *    Catalyst calls /bulk-callback when the job completes — no polling, returns immediately.
- * 7. /bulk-callback handler queues UpdatesSecurity_ClientMasters, CalculateHoldingMaster,
- *    and Cal_CB_Append_TxnUpload once bulk write is confirmed complete.
+ * 7. Returns immediately; background poll checks bulk job status every 30s (fallback when
+ *    Catalyst does not POST to /bulk-callback). Callback or poll queues downstream jobs.
  */
 export const uploadTempTransaction = async (req, res) => {
   let pipelineJobName = null;
@@ -709,6 +916,25 @@ export const uploadTempTransaction = async (req, res) => {
         `Callback registered at ${callbackUrl}`,
     );
 
+    const pipelineMeta = {
+      pipelineJobName,
+      holdingsPairsKey,
+      accountCodesKey,
+      bucketName: BUCKET_NAME,
+      importStartedAtMs: String(uploadMs),
+      objectKey,
+      hasPairs,
+    };
+
+    void pollBulkWriteAndComplete(catalystApp, bulkJob.job_id, pipelineMeta).catch(
+      (err) => {
+        console.error(
+          `[TempTransactionUpload] pollBulkWriteAndComplete fatal:`,
+          err.message,
+        );
+      },
+    );
+
     /* ─── 5. RESPOND IMMEDIATELY ─────────────────────────────────── */
     return res.status(200).json({
       success: true,
@@ -748,18 +974,11 @@ export const uploadTempTransaction = async (req, res) => {
 /**
  * POST /api/transaction-uploader/bulk-callback
  *
- * Catalyst calls this endpoint automatically when the bulk write job
- * completes (success or failure). We return 200 immediately so Catalyst
- * does not retry the callback, then queue the downstream jobs.
- *
- * Downstream jobs triggered on COMPLETED / SUCCESS:
- *   - UpdatesSecurity_ClientMasters
- *   - CalculateHoldingMaster  (only when hasPairs = "true")
- *   - Cal_CB_Append_TxnUpload (only when hasPairs = "true")
+ * Catalyst may POST here when the bulk write job completes. Polling is the primary
+ * fallback when automatic callback delivery fails. Both paths call
+ * completeTxnUploadPipeline (idempotent).
  */
 export const handleBulkCallback = async (req, res) => {
-  // Always return 200 first — Catalyst retries the callback if it
-  // doesn't get a 2xx quickly, which would cause duplicate job queuing.
   res.status(200).json({ received: true });
 
   try {
@@ -771,8 +990,6 @@ export const handleBulkCallback = async (req, res) => {
 
     const body = req.body || {};
 
-    // Diagnostic: log exactly what Catalyst delivers, so we can confirm where the
-    // callback params actually land (body.params vs. query string vs. dropped).
     console.log(
       "[BulkCallback RAW] body=",
       JSON.stringify(body),
@@ -782,124 +999,38 @@ export const handleBulkCallback = async (req, res) => {
       req.headers?.["content-type"] || "",
     );
 
-    // Catalyst sends the job status in the top-level body.
     const status = String(body.status || "").toUpperCase();
-
-    // Custom params travel in the callback URL query string (reliable channel);
-    // body.params is kept as a fallback in case Catalyst ever echoes them. Query wins.
     const p = { ...(body.params || {}), ...(req.query || {}) };
-    const pipelineJobName = String(p.pipelineJobName || "").trim();
-    const holdingsPairsKey = String(p.holdingsPairsKey || "").trim();
-    const accountCodesKey = String(p.accountCodesKey || "").trim();
-    const bucketName = String(p.bucketName || BUCKET_NAME).trim();
-    const importStartedAtMs = String(p.importStartedAtMs || "").trim();
-    const objectKey = String(p.objectKey || "").trim();
-    const hasPairs = p.hasPairs === "true";
+
+    const meta = {
+      pipelineJobName: String(p.pipelineJobName || "").trim(),
+      holdingsPairsKey: String(p.holdingsPairsKey || "").trim(),
+      accountCodesKey: String(p.accountCodesKey || "").trim(),
+      bucketName: String(p.bucketName || BUCKET_NAME).trim(),
+      importStartedAtMs: String(p.importStartedAtMs || "").trim(),
+      objectKey: String(p.objectKey || "").trim(),
+      hasPairs: p.hasPairs === "true" || p.hasPairs === true,
+    };
 
     console.log(
-      `[BulkCallback] status=${status} pipelineJobName=${pipelineJobName} hasPairs=${hasPairs}`,
+      `[BulkCallback] status=${status} pipelineJobName=${meta.pipelineJobName} hasPairs=${meta.hasPairs}`,
     );
 
-    const zcql = catalystApp.zcql();
-
     if (status === "FAILED") {
-      if (pipelineJobName) {
-        await updateJobsStatus(zcql, pipelineJobName, "FAILED");
-      }
-      console.error(
-        "[BulkCallback] Bulk write job FAILED — no downstream jobs queued.",
+      await failTxnUploadPipeline(
+        catalystApp,
+        meta.pipelineJobName,
+        "bulk callback FAILED",
       );
       return;
     }
 
-    const isBulkSuccess =
-      status === "COMPLETED" || status === "SUCCESS" || status === "SUCCESSFUL";
-
-    if (!isBulkSuccess) {
-      // Unexpected status (e.g. RUNNING, IN-PROGRESS) — ignore.
+    if (!isBulkSuccessStatus(status)) {
       console.warn(`[BulkCallback] Unexpected status "${status}" — ignoring.`);
       return;
     }
 
-    // ── Success / COMPLETED ──────────────────────────────────────
-    if (pipelineJobName) {
-      await updateJobsStatus(zcql, pipelineJobName, "COMPLETED");
-    }
-
-    const jobScheduling = catalystApp.jobScheduling();
-
-    // 1. Sync Security_List / client master from the uploaded CSV.
-    try {
-      await jobScheduling.JOB.submitJob({
-        job_name: `USCM_${Date.now()}`.slice(0, 20),
-        jobpool_name: "UpdateMasters",
-        target_name: "UpdatesSecurity_ClientMasters",
-        target_type: "Function",
-        job_config: { number_of_retries: 5, retry_interval: 60 * 1000 },
-        params: { source: "TxnUpload", bucketName, objectKey },
-      });
-      console.log("[BulkCallback] Queued UpdatesSecurity_ClientMasters.");
-    } catch (err) {
-      console.error(
-        "[BulkCallback] Failed to queue UpdatesSecurity_ClientMasters:",
-        err.message,
-      );
-    }
-
-    if (!hasPairs) {
-      console.warn(
-        "[BulkCallback] No pairs — skipping Holdings and Cash jobs.",
-      );
-      return;
-    }
-
-    // 2. Queue CalculateHoldingMaster.
-    try {
-      await jobScheduling.JOB.submitJob({
-        job_name: `CHM_${Date.now()}`.slice(0, 20),
-        jobpool_name: "UpdateMasters",
-        target_name: "CalculateHoldingMaster",
-        target_type: "Function",
-        job_config: { number_of_retries: 5, retry_interval: 60 * 1000 },
-        params: {
-          source: "TxnUpload",
-          pairsObjectKey: holdingsPairsKey,
-          bucketName,
-          importStartedAtMs,
-        },
-      });
-      console.log("[BulkCallback] Queued CalculateHoldingMaster.");
-    } catch (err) {
-      console.error(
-        "[BulkCallback] Failed to queue CalculateHoldingMaster:",
-        err.message,
-      );
-    }
-
-    // 3. Queue Cal_CB_Append_TxnUpload — it discovers affected accounts itself
-    //    from the Transaction table (CREATEDTIME >= importStartedAtMs), paging
-    //    through them with a keyset cursor. No account codes in params (avoids
-    //    the ~5000-char job-param limit) and no Stratus read.
-    try {
-      await jobScheduling.JOB.submitJob({
-        job_name: `CCB_${Date.now()}`.slice(0, 20),
-        jobpool_name: "UpdateMasters",
-        target_name: "Cal_CB_Append_TxnUpload",
-        target_type: "Function",
-        job_config: { number_of_retries: 5, retry_interval: 60 * 1000 },
-        params: {
-          source: "TxnUpload",
-          importStartedAtMs,
-          lastAccount: "",
-        },
-      });
-      console.log("[BulkCallback] Queued Cal_CB_Append_TxnUpload.");
-    } catch (err) {
-      console.error(
-        "[BulkCallback] Failed to queue Cal_CB_Append_TxnUpload:",
-        err.message,
-      );
-    }
+    await completeTxnUploadPipeline(catalystApp, meta, "[BulkCallback]");
   } catch (error) {
     console.error("[BulkCallback] Unexpected error:", error.message);
   }

@@ -217,7 +217,7 @@ appsail-nodejs/
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/upload-temp-file` | Upload broker CSV → Stratus → bulk-write `Transaction` |
-| POST | `/bulk-callback` | Catalyst callback on bulk-write completion → chain downstream jobs |
+| POST | `/bulk-callback` | Optional Catalyst callback on bulk-write completion; poll is primary fallback |
 | GET | `/upload-history` | List past uploads from Stratus keys |
 | GET | `/upload-history/download` | Download historical upload file (presigned URL) |
 
@@ -339,15 +339,18 @@ The largest backend file (~1067 lines). End-to-end flow:
 3. **Upload** to Stratus bucket `client-transaction-files` (`transactions/TxnUpload-<ms>-<filename>`).
 4. **Extract** distinct `(BROKERACID, SYMBOLCODE)` pairs; write JSON manifest to Stratus.
 5. **Bulk-write** to `Transaction` table via `datastore().bulkJob("write")` with callback URL.
-6. **On bulk-callback** (`handleBulkCallback`) when status = `COMPLETED`, fan out **3 parallel jobs**:
+6. **Background poll** (`pollBulkWriteAndComplete`): after upload response, checks bulk job status every **30s** (15s initial delay, 45 min max) — fallback when Catalyst does not POST to `/bulk-callback`.
+7. **On success** (poll or callback → `completeTxnUploadPipeline`), queue **3 downstream jobs** with **10s delay** between each (reduces Dev COMPONENT concurrency burst):
 
 ```
 UpdatesSecurity_ClientMasters  → sync clientIds + Security_List + enrich Transaction
-CalculateHoldingMaster         → fan-out CalculateHoldingWorkers (200 pairs/chunk)
+  (wait 10s)
+CalculateHoldingMaster         → fan-out CalculateHoldingWorkers (200 pairs/chunk, 10s between each slave dispatch)
+  (wait 10s)
 Cal_CB_Append_TxnUpload        → incremental cash passbook append
 ```
 
-Callback returns **200 immediately** to prevent Catalyst retry duplicate job queuing.
+Callback returns **200 immediately** to prevent Catalyst retry duplicate job queuing. Poll and callback both use idempotent `completeTxnUploadPipeline` (only runs when `Jobs.status` is still `RUNNING`). If dispatch still hits concurrency limits, use baton-pass master (6–7 slaves per run) as next step.
 
 #### Cash
 
@@ -787,7 +790,7 @@ functions/
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  TRANSACTION UPLOAD (bulk write callback from AppSail)                  │
+│  TRANSACTION UPLOAD (bulk write poll or callback from AppSail)          │
 │                                                                         │
 │  UpdatesSecurity_ClientMasters ──► clientIds + Security_List + enrich   │
 │         │                                                               │
@@ -1112,7 +1115,7 @@ All FIFO implementations in functions share these rules (matching AppSail previe
 |---------|-------|-----------|
 | **Baton-pass (cursor)** | `Cal_CB_Append_TxnUpload` | After 13 min, re-queue with `lastAccount` keyset cursor |
 | **Baton-pass (target index)** | `UpdateISINWorker` | After 12 min, re-queue at `target_index`; separate `phase=rebuild` job |
-| **Fan-out / chunking** | `CalculateHoldingMaster` | 200 pairs/slave; Stratus manifest avoids 5k param limit |
+| **Fan-out / chunking** | `CalculateHoldingMaster` | 200 pairs/slave; Stratus manifest avoids 5k param limit; **10s delay** between slave `submitJob` calls (baton-pass fallback if needed) |
 | **Scoped rebuild** | `RebuildHoldingtable` | `isinsJson` limits ISINs per account |
 | **Account batching** | Corp-action → rebuild | 400 accounts/job |
 | **Delete loops** | Cash passbook deletes | Repeat DELETE until COUNT=0 (~300 rows/round) |

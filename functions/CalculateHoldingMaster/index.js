@@ -18,6 +18,8 @@
  *   3. submitJob one `CalculateHoldingWorkers` slave per chunk, passing only
  *      { pairsObjectKey, bucketName, chunkStart, chunkCount, importStartedAtMs }.
  *      Each slave re-reads the manifest and processes only its slice.
+ *      A DISPATCH_DELAY_MS pause between each submitJob reduces Dev COMPONENT
+ *      concurrency burst errors (~15 concurrent jobs). Baton-pass is fallback.
  *
  * Slaves run in parallel (subject to job-pool capacity / memory). The slave
  * params stay tiny (a key + two numbers), so Catalyst's job-param size cap is
@@ -42,6 +44,14 @@ const HOLDINGS_UPLOAD_SOURCE = "TxnUpload";
 
 /** Default bucket if the param is missing. */
 const DEFAULT_META_BUCKET = "client-transaction-files";
+
+/**
+ * Pause between each slave submitJob to avoid Dev COMPONENT concurrency burst
+ * (~15 concurrent jobs). First slave dispatches immediately.
+ */
+const DISPATCH_DELAY_MS = 10_000;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /* ============================== HELPERS ============================== */
 
@@ -150,15 +160,22 @@ module.exports = async (jobRequest, context) => {
     console.log(
       `CalculateHoldingMaster: ${total} pair(s) -> ${totalChunks} slave(s) ` +
         `of up to ${CHUNK_SIZE} | bucket=${bucketName} key=${pairsObjectKey} | ` +
-        `importStartedAtMs=${importStartedAtMs}`,
+        `importStartedAtMs=${importStartedAtMs} | dispatchDelayMs=${DISPATCH_DELAY_MS}`,
     );
 
-    // 2 + 3. Dispatch one slave per chunk.
+    // 2 + 3. Dispatch one slave per chunk (staggered to reduce concurrency burst).
     const scheduling = app.jobScheduling();
     let dispatched = 0;
     let failedDispatch = 0;
 
     for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+      if (chunkIndex > 0) {
+        console.log(
+          `CalculateHoldingMaster: waiting ${DISPATCH_DELAY_MS}ms before slave ${chunkIndex + 1}/${totalChunks}`,
+        );
+        await sleep(DISPATCH_DELAY_MS);
+      }
+
       const chunkStart = chunkIndex * CHUNK_SIZE;
       const chunkCount = Math.min(CHUNK_SIZE, total - chunkStart);
       const slaveJobName = `CHS_${chunkIndex}_${startedAt}`.slice(0, 20);
