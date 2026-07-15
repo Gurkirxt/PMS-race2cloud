@@ -345,12 +345,12 @@ The largest backend file (~1067 lines). End-to-end flow:
 ```
 UpdatesSecurity_ClientMasters  → sync clientIds + Security_List + enrich Transaction
   (wait 10s)
-CalculateHoldingMaster         → fan-out CalculateHoldingWorkers (200 pairs/chunk, 10s between each slave dispatch)
+CalculateHoldingMaster         → sliding-window fan-out CalculateHoldingWorkers (≤10 in-flight, baton-pass if needed)
   (wait 10s)
 Cal_CB_Append_TxnUpload        → incremental cash passbook append
 ```
 
-Callback returns **200 immediately** to prevent Catalyst retry duplicate job queuing. Poll and callback both use idempotent `completeTxnUploadPipeline` (only runs when `Jobs.status` is still `RUNNING`). If dispatch still hits concurrency limits, use baton-pass master (6–7 slaves per run) as next step.
+Callback returns **200 immediately** to prevent Catalyst retry duplicate job queuing. Poll and callback both use idempotent `completeTxnUploadPipeline` (only runs when `Jobs.status` is still `RUNNING`). `CalculateHoldingMaster` keeps at most **10** holdings slaves in-flight (Dev COMPONENT pool limit ~15) and re-queues itself when the 15-minute function budget is nearly exhausted.
 
 #### Cash
 
@@ -856,10 +856,12 @@ Triggered by AppSail `handleBulkCallback` after `Transaction` bulk write complet
 
 **Master params:** `source=TxnUpload`, `pairsObjectKey`, `bucketName`, `importStartedAtMs`
 
-**Master flow:**
-1. Read JSON manifest from Stratus: `[[accountCode, ISIN], ...]` (written by AppSail during upload).
-2. Split into chunks of **200 pairs**.
-3. Submit one `CalculateHoldingWorkers` slave per chunk (pool `UpdateMasters`, job name `CHS_{chunkIndex}_{ts}`).
+**Master flow (sliding-window + baton-pass):**
+1. On first run, read pairs manifest from Stratus (`[[accountCode, ISIN], ...]`) and initialize dispatch state at `transactions-meta/holdings-dispatch-{importStartedAtMs}.json` (`nextChunk`, `totalChunks`, `inFlight`, `failedChunks`).
+2. Poll each in-flight slave via `JOB.getJob(jobId)`; remove completed/failed entries.
+3. Fill up to **10** concurrent slots: submit `CalculateHoldingWorkers` per 200-pair chunk (`CHS_{chunkIndex}_{ts}`), retry on COMPONENT concurrency errors with backoff.
+4. When `context.getRemainingExecutionTimeMs()` drops below ~1 min, persist state and **re-queue** `CalculateHoldingMaster` with the same params (`closeWithSuccess` baton-pass).
+5. Complete when all chunks are assigned and `inFlight` is empty (no failed chunks).
 
 **Slave params:** `source=TxnUpload`, `pairsObjectKey`, `bucketName`, `chunkStart`, `chunkCount`, `importStartedAtMs`
 
@@ -1115,7 +1117,7 @@ All FIFO implementations in functions share these rules (matching AppSail previe
 |---------|-------|-----------|
 | **Baton-pass (cursor)** | `Cal_CB_Append_TxnUpload` | After 13 min, re-queue with `lastAccount` keyset cursor |
 | **Baton-pass (target index)** | `UpdateISINWorker` | After 12 min, re-queue at `target_index`; separate `phase=rebuild` job |
-| **Fan-out / chunking** | `CalculateHoldingMaster` | 200 pairs/slave; Stratus manifest avoids 5k param limit; **10s delay** between slave `submitJob` calls (baton-pass fallback if needed) |
+| **Fan-out / sliding window** | `CalculateHoldingMaster` | 200 pairs/slave; ≤10 in-flight slaves; Stratus dispatch state + `getJob` polling; baton-pass master before 15-min timeout |
 | **Scoped rebuild** | `RebuildHoldingtable` | `isinsJson` limits ISINs per account |
 | **Account batching** | Corp-action → rebuild | 400 accounts/job |
 | **Delete loops** | Cash passbook deletes | Repeat DELETE until COUNT=0 (~300 rows/round) |
