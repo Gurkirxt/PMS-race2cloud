@@ -21,9 +21,28 @@ export const exportDataPerAccount = async (req, res) => {
 
     /* ---------------- INIT ---------------- */
     const catalystApp = req.catalystApp;
+    const zcql = catalystApp.zcql();
     const stratus = catalystApp.stratus();
     const bucket = stratus.bucket("upload-data-bucket");
     const bucketDetails = await bucket.getDetails();
+
+    /* ---------------- ACTUAL_CODE LOOKUP ---------------- */
+    // Map the CODE (WS_Account_code) to its Actual_Code from clientIds. Blank
+    // when there is no row or the mapping is empty (no fallback to the code).
+    let actualCode = "";
+    try {
+      const escAcc = String(accountCode).replace(/'/g, "''");
+      const mapRows = await zcql.executeZCQLQuery(
+        `SELECT Actual_Code FROM clientIds WHERE WS_Account_code = '${escAcc}' LIMIT 1`
+      );
+      const mapRow = mapRows?.[0]?.clientIds || mapRows?.[0];
+      actualCode = String(mapRow?.Actual_Code ?? "").trim();
+    } catch (lookupErr) {
+      console.error(
+        `Actual_Code lookup failed for ${accountCode}:`,
+        lookupErr.message
+      );
+    }
 
     /* ---------------- CREATE STREAM ---------------- */
     const csvStream = new PassThrough();
@@ -36,7 +55,7 @@ export const exportDataPerAccount = async (req, res) => {
 
     /* ---------------- CSV HEADER ---------------- */
     csvStream.write(
-      "GENERATED_AT,AS_ON_DATE,ACCOUNT_CODE,SECURITY_NAME,SECURITY_CODE,ISIN,HOLDING,WAP,HOLDING_VALUE,LAST_PRICE,MARKET_VALUE\n"
+      "GENERATED_AT,AS_ON_DATE,CODE,ACTUAL_CODE,SECURITY_NAME,SECURITY_CODE,ISIN,HOLDING,WAP,HOLDING_VALUE,LAST_PRICE,MARKET_VALUE\n"
     );
 
     /* ---------------- FETCH DATA (SINGLE CLIENT) ---------------- */
@@ -63,6 +82,7 @@ export const exportDataPerAccount = async (req, res) => {
         generatedAt,
         reportDate,
         accountCode,
+        actualCode,
         row.stockName ?? "",
         row.securityCode ?? "",
         row.isin ?? "",

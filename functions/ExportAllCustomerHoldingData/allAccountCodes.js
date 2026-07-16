@@ -77,3 +77,37 @@ exports.getAccountActualMapFromDatabase = async (zcql, tableName) => {
     .map(([actualCode, virtualCodes]) => ({ actualCode, virtualCodes }))
     .sort((a, b) => (a.actualCode || "").localeCompare(b.actualCode || ""));
 };
+
+/**
+ * WS_Account_code -> Actual_Code lookup for the scheme-wise holdings export's
+ * ACTUAL_CODE column. Unlike getAccountActualMapFromDatabase, this does NOT
+ * fall back to the virtual code when Actual_Code is blank — a code with no
+ * mapping is left out of the map so the export renders an empty cell.
+ * First mapping wins if a virtual code appears more than once.
+ */
+exports.getVirtualToActualMapFromDatabase = async (zcql, tableName) => {
+  let offset = 0;
+  const limit = 270;
+  let hasNext = true;
+  const map = new Map();
+
+  while (hasNext) {
+    const query = `SELECT WS_Account_code, Actual_Code FROM ${tableName} LIMIT ${limit} OFFSET ${offset}`;
+    const result = await zcql.executeZCQLQuery(query);
+    if (!result.length) break;
+
+    for (const row of result) {
+      const r = row.clientIds || row;
+      const virtual = (r.WS_Account_code ?? "").toString().trim();
+      if (!virtual || map.has(virtual)) continue;
+
+      const actual = (r.Actual_Code ?? "").toString().trim();
+      if (actual) map.set(virtual, actual);
+    }
+
+    offset = offset + limit;
+    if (result.length < limit) hasNext = false;
+  }
+
+  return map;
+};
