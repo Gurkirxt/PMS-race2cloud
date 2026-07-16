@@ -2,6 +2,7 @@ const { Readable } = require("stream");
 const {
   getAllAccountCodesFromDatabase,
   getAccountActualMapFromDatabase,
+  getVirtualToActualMapFromDatabase,
 } = require("./allAccountCodes.js");
 const { calculateHoldingsSummary } = require("./analyticsController.js");
 const catalyst = require("zcatalyst-sdk-node");
@@ -147,12 +148,20 @@ module.exports = async (jobRequest, context) => {
         return;
       }
 
+      // CODE (WS_Account_code) -> ACTUAL_CODE lookup. Codes with no mapping are
+      // absent from the map so the ACTUAL_CODE cell renders blank (no fallback).
+      const actualByCode = await getVirtualToActualMapFromDatabase(
+        zcql,
+        tableName
+      );
+
       csvLines.push(
-        "GENERATED_AT,AS_ON_DATE,ACCOUNT_CODE,SECURITY_NAME,SECURITY_CODE,ISIN,HOLDING,WAP,HOLDING_VALUE,LAST_PRICE,MARKET_VALUE\n"
+        "GENERATED_AT,AS_ON_DATE,CODE,ACTUAL_CODE,SECURITY_NAME,SECURITY_CODE,ISIN,HOLDING,WAP,HOLDING_VALUE,LAST_PRICE,MARKET_VALUE\n"
       );
 
       for (const client of clientIds) {
         const accountCode = client.clientIds.WS_Account_code;
+        const actualCode = actualByCode.get(String(accountCode).trim()) || "";
 
         try {
           console.log(
@@ -176,6 +185,7 @@ module.exports = async (jobRequest, context) => {
               generatedAt,
               reportDate,
               accountCode,
+              actualCode,
               row.stockName ?? "",
               row.securityCode ?? "",
               row.isin ?? "",

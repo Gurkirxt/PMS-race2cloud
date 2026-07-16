@@ -1,1 +1,6 @@
-{}
+{
+    "files.exclude": {
+        ".build/**": true,
+        "**/.output/**": true
+    }
+}
