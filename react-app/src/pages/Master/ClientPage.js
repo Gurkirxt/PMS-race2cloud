@@ -12,8 +12,8 @@ const SYSTEM_FIELDS = ["ROWID", "CREATORID", "CREATEDTIME", "MODIFIEDTIME"];
 /* Business columns intentionally hidden from the table. */
 const HIDDEN_FIELDS = ["WS_client_id"];
 const ACCOUNT_FIELD = "WS_Account_code";
-/* Search filters on the actual (broker) code — one actual maps to many virtual codes. */
-const SEARCH_FIELD = "Actual_Code";
+/* Search filters on the virtual account code. */
+const SEARCH_FIELD = "WS_Account_code";
 
 /* Header overrides — data key stays the same, only the displayed label changes. */
 const COLUMN_LABELS = { WS_Account_code: "Virtual Code" };
@@ -88,7 +88,7 @@ function ClientPage() {
     );
   }, [clients]);
 
-  /* The search box filters the table by actual code — returns every virtual code for it. */
+  /* The search box filters the table by WS_Account_code (virtual code). */
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return clients;
@@ -113,7 +113,7 @@ function ClientPage() {
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
-  /* Autocomplete suggestions — distinct actual codes (deduped) from the matches. */
+  /* Autocomplete suggestions — distinct virtual codes (deduped) from the matches. */
   const suggestions = useMemo(() => {
     const seen = new Set();
     const out = [];
@@ -146,13 +146,13 @@ function ClientPage() {
           <div className="client-filter-card">
             <div className="cash-filter-field">
               <div className="account-code-search" ref={dropdownRef}>
-                <label className="search-label">Filter by Actual Code</label>
+                <label className="search-label">Filter by Virtual Code</label>
                 <div className="search-input-wrapper">
                   <span className="search-icon">&#128269;</span>
                   <input
                     type="text"
                     className="search-input"
-                    placeholder="Search Actual Code..."
+                    placeholder="Search Virtual Code..."
                     value={search}
                     onChange={(e) => {
                       setSearch(e.target.value);
@@ -169,7 +169,7 @@ function ClientPage() {
 
                 {showDropdown && suggestions.length > 0 && (
                   <div className="search-dropdown">
-                    <div className="dropdown-header">Actual Code</div>
+                    <div className="dropdown-header">Virtual Code</div>
                     <div className="dropdown-options">
                       {suggestions.map((code) => (
                         <div
