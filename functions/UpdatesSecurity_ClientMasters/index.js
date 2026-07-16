@@ -4,8 +4,12 @@
  * UpdatesSecurity_ClientMasters (Catalyst Job Function)
  *
  * Job twin of UpdateSecurity_ClientMaster (event). Reads transaction CSV from Stratus,
- * ensures clientIds + Security_List rows, enriches Transaction from Security_List when
- * master has both Security_Code and Security_Name.
+ * collects unique BROKERACID / SYMBOLCODE via Sets (file duplicates collapsed), then
+ * bulk-inserts stubs into clientIds (WS_Account_code) and Security_List (ISIN only).
+ * Catalyst bulk write skips rows that violate unique constraints.
+ *
+ * Transaction enrich from Security_List is commented out (was timing out on large
+ * uploads — sequential UPDATE Transaction per ISIN).
  *
  * Queued from TempTransactionUpload with bucketName + objectKey after bulk import.
  */
@@ -17,8 +21,10 @@ const catalyst = require("zcatalyst-sdk-node");
 const LOG = "[UpdatesSecurity_ClientMasters]";
 const ALLOWED_BUCKET = "client-transaction-files";
 const ALLOWED_KEY_PREFIX = "transactions/";
+const META_KEY_PREFIX = "transactions-meta/";
 
-const esc = (v) => String(v ?? "").replace(/'/g, "''");
+const POLL_INTERVAL_MS = 3000;
+const POLL_MAX_WAIT_MS = 10 * 60 * 1000;
 
 const isValid = (v) =>
   v != null && v !== "" && String(v).toLowerCase() !== "null";
@@ -72,7 +78,102 @@ function createCsvParser() {
   });
 }
 
-async function processCsvObjectForMasters(bucket, objectKey, zcql) {
+function csvCell(value) {
+  const s = value === null || value === undefined ? "" : String(value);
+  if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Build a one-column CSV for Catalyst bulk insert.
+ * @param {string} headerColumn Table column name (must match Data Store schema).
+ * @param {Iterable<string>} values Unique stub values.
+ */
+function buildSingleColumnCsv(headerColumn, values) {
+  const lines = [headerColumn];
+  for (const v of values) {
+    lines.push(csvCell(v));
+  }
+  return lines.join("\n");
+}
+
+async function pollBulkWriteJob(bulkWrite, jobId) {
+  const start = Date.now();
+  while (Date.now() - start < POLL_MAX_WAIT_MS) {
+    await sleep(POLL_INTERVAL_MS);
+    try {
+      const res = await bulkWrite.getStatus(jobId);
+      const st = String(res.status || "").toUpperCase();
+      console.log(`${LOG} Bulk write ${jobId} status: ${st}`);
+      if (st === "COMPLETED" || st === "COMPLETE" || st === "SUCCESS") {
+        return res;
+      }
+      if (st === "FAILED" || st === "FAILURE" || st === "ERROR") {
+        throw new Error(
+          `Bulk write job ${jobId} failed: ${JSON.stringify(res)}`,
+        );
+      }
+    } catch (err) {
+      if (String(err?.message || "").includes("failed")) throw err;
+      console.warn(`${LOG} Error polling bulk job ${jobId}:`, err.message);
+    }
+  }
+  throw new Error(
+    `Bulk write job ${jobId} timed out after ${POLL_MAX_WAIT_MS}ms`,
+  );
+}
+
+/**
+ * Upload a stub CSV to Stratus and bulk-insert into a Data Store table.
+ * Unique columns (WS_Account_code / ISIN): existing rows are skipped by Catalyst.
+ */
+async function bulkInsertStubs({
+  catalystApp,
+  bucket,
+  bucketName,
+  tableName,
+  headerColumn,
+  values,
+  objectKeySuffix,
+}) {
+  const list = [...values].filter(isValid);
+  if (!list.length) {
+    console.log(`${LOG} No values to bulk-insert into ${tableName}`);
+    return;
+  }
+
+  const objectKey = `${META_KEY_PREFIX}masters-bulk-${tableName}-${objectKeySuffix}.csv`;
+  const csvBody = buildSingleColumnCsv(headerColumn, list);
+
+  await bucket.putObject(objectKey, Buffer.from(csvBody, "utf8"), {
+    overwrite: true,
+    contentType: "text/csv",
+  });
+  console.log(
+    `${LOG} Uploaded ${list.length} stub row(s) for ${tableName} → ${objectKey}`,
+  );
+
+  const bulkWrite = catalystApp.datastore().table(tableName).bulkJob("write");
+  const job = await bulkWrite.createJob(
+    { bucket_name: bucketName, object_key: objectKey },
+    { operation: "insert" },
+  );
+  const jobId = job?.job_id || job?.id;
+  if (!jobId) {
+    throw new Error(
+      `bulkJob createJob for ${tableName} returned no job_id: ${JSON.stringify(job)}`,
+    );
+  }
+  console.log(`${LOG} Created bulk insert job ${jobId} for ${tableName}`);
+  await pollBulkWriteJob(bulkWrite, jobId);
+  console.log(`${LOG} Bulk insert into ${tableName} completed (${list.length} unique value(s))`);
+}
+
+async function collectUniqueFromTxnCsv(bucket, objectKey) {
   const accountCodes = new Set();
   const isins = new Set();
   let dataRowCount = 0;
@@ -122,123 +223,48 @@ async function processCsvObjectForMasters(bucket, objectKey, zcql) {
     `dataRows=${dataRowCount} uniqueAccountCodes=${accountCodes.size} uniqueIsins=${isins.size}`,
   );
 
-  for (const wsAccountCode of accountCodes) {
-    await ensureClientIds(zcql, wsAccountCode);
-  }
-  for (const isin of isins) {
-    await ensureSecurityList(zcql, isin);
-  }
-
-  await enrichTransactionRowsFromSecurityList(zcql, isins);
+  return { accountCodes, isins };
 }
 
-function hasFilledSecurityMaster(securityCode, securityName) {
-  const c = securityCode != null ? String(securityCode).trim() : "";
-  const n = securityName != null ? String(securityName).trim() : "";
-  return c.length > 0 && n.length > 0;
+async function processCsvObjectForMasters(catalystApp, bucket, bucketName, objectKey) {
+  const { accountCodes, isins } = await collectUniqueFromTxnCsv(
+    bucket,
+    objectKey,
+  );
+
+  const stamp = `${Date.now()}`;
+
+  await bulkInsertStubs({
+    catalystApp,
+    bucket,
+    bucketName,
+    tableName: "clientIds",
+    headerColumn: "WS_Account_code",
+    values: accountCodes,
+    objectKeySuffix: stamp,
+  });
+
+  await bulkInsertStubs({
+    catalystApp,
+    bucket,
+    bucketName,
+    tableName: "Security_List",
+    headerColumn: "ISIN",
+    values: isins,
+    objectKeySuffix: stamp,
+  });
+
+  // Transaction enrich disabled — was timing out on large uploads (per-ISIN UPDATE).
+  // await enrichTransactionRowsFromSecurityList(zcql, isins);
 }
 
-async function fetchSecurityListRow(zcql, isin) {
-  const rows = await zcql.executeZCQLQuery(`
-    SELECT Security_Code, Security_Name FROM Security_List
-    WHERE ISIN = '${esc(isin)}'
-    LIMIT 1
-  `);
-  if (!rows?.length) return null;
-  const r = rows[0].Security_List || rows[0];
-  return {
-    securityCode: r.Security_Code ?? r.security_code,
-    securityName: r.Security_Name ?? r.security_name,
-  };
-}
-
-async function enrichTransactionRowsFromSecurityList(zcql, isins) {
-  for (const rawIsin of isins) {
-    const isin = String(rawIsin ?? "").trim();
-    if (!isValid(isin)) continue;
-
-    let master;
-    try {
-      master = await fetchSecurityListRow(zcql, isin);
-    } catch (e) {
-      console.warn(`${LOG} Security_List read failed for ${isin}:`, e.message);
-      continue;
-    }
-    if (
-      !master ||
-      !hasFilledSecurityMaster(master.securityCode, master.securityName)
-    ) {
-      continue;
-    }
-
-    const codeEsc = esc(String(master.securityCode).trim());
-    const nameEsc = esc(String(master.securityName).trim());
-
-    try {
-      await zcql.executeZCQLQuery(`
-        UPDATE Transaction
-        SET
-          Security_code = '${codeEsc}',
-          Security_Name = '${nameEsc}'
-        WHERE ISIN = '${esc(isin)}'
-        AND (
-          Security_code IS NULL OR Security_code = ''
-          OR Security_Name IS NULL OR Security_Name = ''
-        )
-      `);
-      console.log(
-        `${LOG} Transaction enriched from Security_List for ISIN:`,
-        isin,
-      );
-    } catch (e) {
-      console.warn(
-        `${LOG} Transaction enrich failed for ISIN ${isin}:`,
-        e.message,
-      );
-    }
-  }
-}
-
-async function ensureClientIds(zcql, wsAccountCode) {
-  if (!isValid(wsAccountCode)) return;
-
-  const existingClient = await zcql.executeZCQLQuery(`
-    SELECT ROWID FROM clientIds
-    WHERE WS_Account_code = '${esc(wsAccountCode)}'
-  `);
-
-  if (!existingClient.length) {
-    try {
-      await zcql.executeZCQLQuery(`
-        INSERT INTO clientIds (WS_Account_code)
-        VALUES ('${esc(wsAccountCode)}')
-      `);
-    } catch (err) {
-      if (String(err?.message || "").includes("Duplicate")) return;
-      throw err;
-    }
-  }
-}
-
-async function ensureSecurityList(zcql, isin) {
-  if (!isValid(isin)) return;
-
-  const byIsin = await zcql.executeZCQLQuery(`
-    SELECT ROWID FROM Security_List
-    WHERE ISIN = '${esc(isin)}'
-  `);
-  if (byIsin.length) return;
-
-  try {
-    await zcql.executeZCQLQuery(`
-      INSERT INTO Security_List (ISIN)
-      VALUES ('${esc(isin)}')
-    `);
-  } catch (err) {
-    if (String(err?.message || "").includes("Duplicate")) return;
-    throw err;
-  }
-}
+/*
+ * COMMENTED OUT — Transaction enrich from Security_List.
+ * Previously: for each ISIN, if Security_List had both Security_Code and
+ * Security_Name, UPDATE Transaction rows where code and/or name were empty.
+ * Re-enable (or move to a chunked/baton job) if blank Transaction fields need
+ * backfill from master again.
+ */
 
 function parseJobParams(jobRequest) {
   try {
@@ -274,12 +300,16 @@ module.exports = async (jobRequest, context) => {
     }
 
     const catalystApp = catalyst.initialize(context);
-    const zcql = catalystApp.zcql();
     const bucket = catalystApp.stratus().bucket(bucketName);
 
     console.log(`${LOG} Processing`, bucketName, objectKey);
 
-    await processCsvObjectForMasters(bucket, objectKey, zcql);
+    await processCsvObjectForMasters(
+      catalystApp,
+      bucket,
+      bucketName,
+      objectKey,
+    );
 
     context.closeWithSuccess();
   } catch (err) {
