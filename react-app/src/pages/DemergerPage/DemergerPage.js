@@ -189,11 +189,12 @@ function DemergerPage() {
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
+  const q = searchQuery.toLowerCase();
   const filteredSecurities = securities.filter(
     (s) =>
-      s.isin.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      s.securityCode.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      s.securityName.toLowerCase().includes(searchQuery.toLowerCase()),
+      String(s?.isin ?? "").toLowerCase().includes(q) ||
+      String(s?.securityCode ?? "").toLowerCase().includes(q) ||
+      String(s?.securityName ?? "").toLowerCase().includes(q),
   );
 
   const handleSelectOldISIN = (sec) => {
@@ -438,9 +439,9 @@ function DemergerPage() {
                   <div className="search-dropdown">
                     <div className="dropdown-header">Select Old Company</div>
                     <div className="dropdown-options">
-                      {filteredSecurities.map((sec) => (
+                      {filteredSecurities.map((sec, idx) => (
                         <div
-                          key={sec.isin}
+                          key={`${sec.isin || "no-isin"}-${idx}`}
                           className="dropdown-option"
                           onClick={() => handleSelectOldISIN(sec)}
                         >

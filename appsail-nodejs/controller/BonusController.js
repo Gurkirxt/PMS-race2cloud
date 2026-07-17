@@ -1,3 +1,5 @@
+import { buildVirtualToActualMap } from "../util/mapVirtualToActualCodes.js";
+
 const ZCQL_ROW_LIMIT = 270;
 const HOLDINGS_BATCH  = 250;
 
@@ -134,6 +136,10 @@ export const previewStockBonus = async (req, res) => {
        Holdings table already has HOLDING, WAP, HOLDING_VALUE
        computed by FIFO. No need to re-run FIFO engine.
        ====================================================== */
+    const virtualToActual = await buildVirtualToActualMap(
+      zcql,
+      [...latestByAccount.keys()],
+    );
     const preview = [];
 
     for (const [accountCode, h] of latestByAccount) {
@@ -156,7 +162,8 @@ export const previewStockBonus = async (req, res) => {
 
       preview.push({
         isin,
-        accountCode,
+        accountCode, // WS_Account_code (virtual)
+        actualCode: virtualToActual.get(accountCode) || "",
         currentHolding,
         currentWAP,
         holdingValue,

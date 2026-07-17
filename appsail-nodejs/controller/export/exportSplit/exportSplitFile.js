@@ -1,4 +1,5 @@
 import { runFifoEngine } from "../../../util/analytics/transactionHistory/fifo.js";
+import { buildVirtualToActualMap } from "../../../util/mapVirtualToActualCodes.js";
 
 const BATCH_SIZE = 270;
 
@@ -26,7 +27,8 @@ export const exportSplitPreviewFile = async (req, res) => {
     const zcql = catalystApp.zcql();
     const bucket = catalystApp.stratus().bucket("export-app-data");
 
-    let csv = "ISIN,ACCOUNT_CODE,CURRENT_HOLDING,NEW_HOLDING,DELTA\n";
+    let csv =
+      "ISIN,VIRTUAL_CODE,ACTUAL_CODE,CURRENT_HOLDING,NEW_HOLDING,DELTA\n";
 
     /* ================= FIND ACCOUNTS WITH TRANSACTIONS ================= */
     const accountSet = new Set();
@@ -51,6 +53,11 @@ export const exportSplitPreviewFile = async (req, res) => {
     if (!eligibleAccounts.length) {
       return res.json({ success: false, message: "No eligible accounts" });
     }
+
+    const virtualToActual = await buildVirtualToActualMap(
+      zcql,
+      eligibleAccounts,
+    );
 
     /* ================= FETCH TX / BONUS / PAST SPLITS (ROWID dedupe) ================= */
     const fetchAllDeduped = async (table, dateCol, operator, orderBySql) => {
@@ -137,8 +144,9 @@ export const exportSplitPreviewFile = async (req, res) => {
 
       const newHolding = Math.floor(before.holdings * splitMultiplier);
       const delta = newHolding - before.holdings;
+      const actualCode = virtualToActual.get(acc) || "";
 
-      csv += `"${isin}","${acc}","${before.holdings}","${newHolding}","${delta}"\n`;
+      csv += `"${isin}","${acc}","${actualCode}","${before.holdings}","${newHolding}","${delta}"\n`;
     }
 
     /* ================= UPLOAD ================= */

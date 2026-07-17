@@ -36,7 +36,8 @@
       "CalculateHoldingWorkers",
       "CalculateHoldingMaster",
       "HoldingUpdateManually",
-      "UpdateISINWorker"
+      "UpdateISINWorker",
+      "EnrichTransactionSecurity"
     ],
     "ignore": [],
     "source": "functions"

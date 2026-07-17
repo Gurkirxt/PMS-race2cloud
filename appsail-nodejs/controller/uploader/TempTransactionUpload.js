@@ -158,7 +158,12 @@ async function completeTxnUploadPipeline(catalystApp, meta, logPrefix = "[TxnUpl
       target_name: "UpdatesSecurity_ClientMasters",
       target_type: "Function",
       job_config: { number_of_retries: 5, retry_interval: 60 * 1000 },
-      params: { source: "TxnUpload", bucketName, objectKey },
+      params: {
+        source: "TxnUpload",
+        bucketName,
+        objectKey,
+        importStartedAtMs: String(importStartedAtMs || ""),
+      },
     });
     console.log(`${logPrefix} Queued UpdatesSecurity_ClientMasters.`);
   } catch (err) {
