@@ -114,11 +114,12 @@ function SplitPage() {
   /* ===========================
      FILTER ISIN SEARCH
      =========================== */
+  const q = searchQuery.toLowerCase();
   const filteredSecurities = securities.filter(
     (sec) =>
-      sec.isin.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      sec.securityCode.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      sec.securityName.toLowerCase().includes(searchQuery.toLowerCase()),
+      String(sec?.isin ?? "").toLowerCase().includes(q) ||
+      String(sec?.securityCode ?? "").toLowerCase().includes(q) ||
+      String(sec?.securityName ?? "").toLowerCase().includes(q),
   );
 
   /* ===========================
@@ -238,9 +239,9 @@ function SplitPage() {
                 <div className="dropdown-header">Search ISIN</div>
 
                 <div className="dropdown-options">
-                  {filteredSecurities.map((sec) => (
+                  {filteredSecurities.map((sec, idx) => (
                     <div
-                      key={sec.isin}
+                      key={`${sec.isin || "no-isin"}-${idx}`}
                       className="dropdown-option"
                       onClick={() => handleSelectISIN(sec)}
                     >
@@ -333,7 +334,8 @@ function SplitPage() {
                 <table className="bonus-preview-table">
                   <thead>
                     <tr>
-                      <th>Account Code</th>
+                      <th>Virtual Code</th>
+                      <th>Actual Code</th>
                       <th>Current Holding</th>
                       <th>New Holding</th>
                       <th>Δ Change</th>
@@ -343,6 +345,7 @@ function SplitPage() {
                     {paginatedPreview.map((row, idx) => (
                       <tr key={(page - 1) * PAGE_SIZE + idx}>
                         <td>{row.accountCode}</td>
+                        <td>{row.actualCode || "—"}</td>
                         <td>{Math.floor(Number(row.currentHolding) || 0)}</td>
                         <td>{Math.floor(Number(row.newHolding) || 0)}</td>
                         <td className="delta-cell">

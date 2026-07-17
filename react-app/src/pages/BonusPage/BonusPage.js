@@ -137,11 +137,12 @@ function BonusPage() {
     return () => clearInterval(interval);
   }, [applyJobName, applying, applyStatus]);
 
+  const q = searchQuery.toLowerCase();
   const filteredSecurities = securities.filter(
     (s) =>
-      s.isin.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      s.securityCode.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      s.securityName.toLowerCase().includes(searchQuery.toLowerCase()),
+      String(s?.isin ?? "").toLowerCase().includes(q) ||
+      String(s?.securityCode ?? "").toLowerCase().includes(q) ||
+      String(s?.securityName ?? "").toLowerCase().includes(q),
   );
 
   const handleSelectISIN = (sec) => {
@@ -237,9 +238,9 @@ function BonusPage() {
               <div className="search-dropdown">
                 <div className="dropdown-header">Search ISIN</div>
                 <div className="dropdown-options">
-                  {filteredSecurities.map((sec) => (
+                  {filteredSecurities.map((sec, idx) => (
                     <div
-                      key={sec.isin}
+                      key={`${sec.isin || "no-isin"}-${idx}`}
                       className="dropdown-option"
                       onClick={() => handleSelectISIN(sec)}
                     >
@@ -323,7 +324,8 @@ function BonusPage() {
                 <table className="bonus-preview-table">
                   <thead>
                     <tr>
-                      <th>Account Code</th>
+                      <th>Virtual Code</th>
+                      <th>Actual Code</th>
                       <th>ISIN</th>
                       <th>Current Holding</th>
                       <th>Bonus Shares</th>
@@ -336,6 +338,7 @@ function BonusPage() {
                     {paginatedPreview.map((row) => (
                       <tr key={row.accountCode}>
                         <td>{row.accountCode}</td>
+                        <td>{row.actualCode || "—"}</td>
                         <td>{row.isin}</td>
                         <td>{Math.floor(Number(row.currentHolding) || 0)}</td>
                         <td>{row.bonusShares}</td>
