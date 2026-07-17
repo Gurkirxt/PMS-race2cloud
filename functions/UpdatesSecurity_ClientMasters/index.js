@@ -4,14 +4,21 @@
  * UpdatesSecurity_ClientMasters (Catalyst Job Function)
  *
  * Job twin of UpdateSecurity_ClientMaster (event). Reads transaction CSV from Stratus,
- * collects unique BROKERACID / SYMBOLCODE via Sets (file duplicates collapsed), then
- * bulk-inserts stubs into clientIds (WS_Account_code) and Security_List (ISIN only).
+ * collects unique BROKERACID / SYMBOLCODE via Sets (file duplicates collapsed), writes
+ * those lists to Stratus JSON (source of truth), drops the Sets from memory, then
+ * bulk-inserts stubs into clientIds (WS_Account_code) and Security_List (ISIN only)
+ * using the arrays reloaded from those JSON files.
  * Catalyst bulk write skips rows that violate unique constraints.
  *
- * Transaction enrich from Security_List is commented out (was timing out on large
- * uploads — sequential UPDATE Transaction per ISIN).
+ * Transaction enrich is queued after masters via EnrichTransactionSecurity
+ * (reads unique-isins JSON from Stratus).
  *
- * Queued from TempTransactionUpload with bucketName + objectKey after bulk import.
+ * Queued from TempTransactionUpload with bucketName + objectKey + importStartedAtMs
+ * after bulk import.
+ *
+ * Stratus meta keys (same stamp):
+ *   transactions-meta/unique-accounts-{stamp}.json
+ *   transactions-meta/unique-isins-{stamp}.json
  */
 
 const { Readable } = require("stream");
@@ -70,6 +77,14 @@ function rawToUtf8(raw) {
   return String(raw);
 }
 
+async function streamToString(stream) {
+  const chunks = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 function createCsvParser() {
   return csv({
     skipEmptyLines: true,
@@ -99,6 +114,40 @@ function buildSingleColumnCsv(headerColumn, values) {
     lines.push(csvCell(v));
   }
   return lines.join("\n");
+}
+
+async function writeJsonToStratus(bucket, objectKey, value) {
+  await bucket.putObject(objectKey, Buffer.from(JSON.stringify(value), "utf8"), {
+    overwrite: true,
+    contentType: "application/json",
+  });
+  console.log(`${LOG} Wrote Stratus JSON → ${objectKey}`);
+}
+
+async function readJsonArrayFromStratus(bucket, objectKey) {
+  const raw = await bucket.getObject(objectKey);
+  let text = "";
+  if (raw != null && typeof raw === "object" && typeof raw.pipe === "function") {
+    text = await streamToString(raw);
+  } else {
+    text = rawToUtf8(raw);
+  }
+  text = String(text || "").trim();
+  if (!text) {
+    throw new Error(`Empty Stratus object: ${objectKey}`);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    throw new Error(
+      `Invalid JSON at ${objectKey}: ${err.message}`,
+    );
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`Expected JSON array at ${objectKey}`);
+  }
+  return parsed.map((v) => String(v ?? "").trim()).filter(isValid);
 }
 
 async function pollBulkWriteJob(bulkWrite, jobId) {
@@ -226,13 +275,48 @@ async function collectUniqueFromTxnCsv(bucket, objectKey) {
   return { accountCodes, isins };
 }
 
-async function processCsvObjectForMasters(catalystApp, bucket, bucketName, objectKey) {
-  const { accountCodes, isins } = await collectUniqueFromTxnCsv(
+/**
+ * Persist unique lists to Stratus, free Sets, reload from files, bulk-insert masters,
+ * then queue EnrichTransactionSecurity with the unique-isins Stratus key.
+ */
+async function processCsvObjectForMasters(
+  catalystApp,
+  bucket,
+  bucketName,
+  objectKey,
+  importStartedAtMs,
+) {
+  let { accountCodes, isins } = await collectUniqueFromTxnCsv(
     bucket,
     objectKey,
   );
 
   const stamp = `${Date.now()}`;
+  const accountsObjectKey = `${META_KEY_PREFIX}unique-accounts-${stamp}.json`;
+  const isinsObjectKey = `${META_KEY_PREFIX}unique-isins-${stamp}.json`;
+
+  const accountsArr = [...accountCodes].filter(isValid);
+  const isinsArr = [...isins].filter(isValid);
+
+  // Drop Sets ASAP so they do not hold function memory during Stratus I/O + bulk jobs.
+  accountCodes.clear();
+  isins.clear();
+  accountCodes = null;
+  isins = null;
+
+  await writeJsonToStratus(bucket, accountsObjectKey, accountsArr);
+  await writeJsonToStratus(bucket, isinsObjectKey, isinsArr);
+
+  // Drop local arrays; reload from Stratus as the source of truth for inserts.
+  accountsArr.length = 0;
+  isinsArr.length = 0;
+
+  const accountsFromFile = await readJsonArrayFromStratus(bucket, accountsObjectKey);
+  const isinsFromFile = await readJsonArrayFromStratus(bucket, isinsObjectKey);
+
+  console.log(
+    `${LOG} Reloaded from Stratus: accounts=${accountsFromFile.length} isins=${isinsFromFile.length}`,
+  );
 
   await bulkInsertStubs({
     catalystApp,
@@ -240,7 +324,7 @@ async function processCsvObjectForMasters(catalystApp, bucket, bucketName, objec
     bucketName,
     tableName: "clientIds",
     headerColumn: "WS_Account_code",
-    values: accountCodes,
+    values: accountsFromFile,
     objectKeySuffix: stamp,
   });
 
@@ -250,21 +334,44 @@ async function processCsvObjectForMasters(catalystApp, bucket, bucketName, objec
     bucketName,
     tableName: "Security_List",
     headerColumn: "ISIN",
-    values: isins,
+    values: isinsFromFile,
     objectKeySuffix: stamp,
   });
 
-  // Transaction enrich disabled — was timing out on large uploads (per-ISIN UPDATE).
-  // await enrichTransactionRowsFromSecurityList(zcql, isins);
-}
+  console.log(
+    `${LOG} Masters done. accountsObjectKey=${accountsObjectKey} isinsObjectKey=${isinsObjectKey}`,
+  );
 
-/*
- * COMMENTED OUT — Transaction enrich from Security_List.
- * Previously: for each ISIN, if Security_List had both Security_Code and
- * Security_Name, UPDATE Transaction rows where code and/or name were empty.
- * Re-enable (or move to a chunked/baton job) if blank Transaction fields need
- * backfill from master again.
- */
+  // Queue enrich after masters exist (Security_List stubs + any existing code/name).
+  try {
+    const scheduling = catalystApp.jobScheduling();
+    const enrichJobName = `ETS_${Date.now()}`.slice(0, 20);
+    await scheduling.JOB.submitJob({
+      job_name: enrichJobName,
+      jobpool_name: "UpdateMasters",
+      target_name: "EnrichTransactionSecurity",
+      target_type: "Function",
+      job_config: { number_of_retries: 5, retry_interval: 60 * 1000 },
+      params: {
+        source: "TxnUpload",
+        bucketName,
+        isinsObjectKey,
+        importStartedAtMs: String(importStartedAtMs || ""),
+        lastIsin: "",
+      },
+    });
+    console.log(
+      `${LOG} Queued EnrichTransactionSecurity (${enrichJobName}) isinsObjectKey=${isinsObjectKey}`,
+    );
+  } catch (enrichErr) {
+    console.error(
+      `${LOG} Failed to queue EnrichTransactionSecurity:`,
+      enrichErr.message,
+    );
+  }
+
+  return { accountsObjectKey, isinsObjectKey, stamp };
+}
 
 function parseJobParams(jobRequest) {
   try {
@@ -286,6 +393,9 @@ module.exports = async (jobRequest, context) => {
     const objectKey = String(
       params.objectKey ?? params.object_key ?? "",
     ).trim();
+    const importStartedAtMs = String(
+      params.importStartedAtMs ?? params.import_started_at_ms ?? "",
+    ).trim();
 
     if (!objectKey || !isAllowedObjectKey(objectKey)) {
       console.warn(`${LOG} Missing or invalid objectKey:`, objectKey);
@@ -302,13 +412,19 @@ module.exports = async (jobRequest, context) => {
     const catalystApp = catalyst.initialize(context);
     const bucket = catalystApp.stratus().bucket(bucketName);
 
-    console.log(`${LOG} Processing`, bucketName, objectKey);
+    console.log(
+      `${LOG} Processing`,
+      bucketName,
+      objectKey,
+      `importStartedAtMs=${importStartedAtMs || "(none)"}`,
+    );
 
     await processCsvObjectForMasters(
       catalystApp,
       bucket,
       bucketName,
       objectKey,
+      importStartedAtMs,
     );
 
     context.closeWithSuccess();

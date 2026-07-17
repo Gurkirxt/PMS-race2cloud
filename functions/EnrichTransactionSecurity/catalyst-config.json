@@ -1,0 +1,10 @@
+{
+  "execution": {
+    "main": "index.js"
+  },
+  "deployment": {
+    "stack": "node20",
+    "name": "EnrichTransactionSecurity",
+    "type": "job"
+  }
+}

@@ -1,3 +1,5 @@
+import { buildVirtualToActualMap } from "../../util/mapVirtualToActualCodes.js";
+
 const HOLDINGS_BATCH = 250;
 
 export const getAllSecuritiesISINs = async (req, res) => {
@@ -136,6 +138,10 @@ export const previewStockSplit = async (req, res) => {
          holdingValue    = unchanged (same total cost)
          newWAP          = holdingValue / newHolding (price per share halves)
        ====================================================== */
+    const virtualToActual = await buildVirtualToActualMap(
+      zcql,
+      [...latestByAccount.keys()],
+    );
     const preview = [];
     const splitMultiplier = r2 / r1;
 
@@ -156,7 +162,8 @@ export const previewStockSplit = async (req, res) => {
 
       preview.push({
         isin,
-        accountCode,
+        accountCode, // WS_Account_code (virtual)
+        actualCode: virtualToActual.get(accountCode) || "",
         currentHolding,
         currentWAP,
         holdingValue,

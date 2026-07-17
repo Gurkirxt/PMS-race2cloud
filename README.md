@@ -16,7 +16,7 @@ A full-stack **Portfolio Management System** built on **Zoho Catalyst**, designe
 ┌─────────────────────────────────────────────────────────────────┐
 │              appsail-nodejs (Express 4, ESM, port 9000)         │
 │   catalyst.initialize(req) → req.catalystApp on every request   │
-│   15 routers · 28 controllers · 19 util modules                 │
+│   15 routers · 28 controllers · 20 util modules                 │
 └──────┬──────────────────┬──────────────────┬────────────────────┘
        │ ZCQL             │ Stratus          │ jobScheduling()
        ▼                  ▼                  ▼
@@ -110,7 +110,7 @@ appsail-nodejs/
 │   ├── TransactionController.js, DashboardController.js
 │   ├── MergerController.js, BonusController.js
 │
-└── util/                             # 19 utility modules
+└── util/                             # 20 utility modules
     ├── analytics/
     │   ├── holdingsFromTable.js      # Read materialised Holdings table
     │   ├── consolidatedHoldings.js   # Group by Actual_Code
@@ -119,6 +119,7 @@ appsail-nodejs/
     ├── merger/mergerEngine.js, lotFifo.js
     ├── custodian/parseCustodianCsv.js
     ├── export/fifo.js                # (orphan duplicate — unused)
+    ├── mapVirtualToActualCodes.js    # clientIds WS→Actual (Split/Bonus preview)
     └── allAccountCodes.js, stratusSignedUrl.js, reportTimestamp.js
 ```
 
@@ -160,20 +161,20 @@ appsail-nodejs/
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST | `/preview` | Preview stock split impact on holdings |
+| POST | `/preview` | Preview stock split impact; includes `accountCode` (virtual) + `actualCode` |
 | POST | `/add` | Apply split (insert `Split` row + queue rebuild jobs) |
 | GET | `/getAllSecuritiesList` | Security list for dropdown |
-| GET | `/export-preview` | Export split preview CSV |
+| GET | `/export-preview` | Export split preview CSV (`VIRTUAL_CODE`, `ACTUAL_CODE`, holdings, delta) |
 
 #### `/api/bonus`
 
 | Method | Path | Purpose |
 |--------|------|---------|
 | GET | `/getAllSecuritiesList` | Security list |
-| POST | `/preview` | Bonus preview from Holdings as-of ex-date |
+| POST | `/preview` | Bonus preview from Holdings as-of ex-date; includes `accountCode` (virtual) + `actualCode` |
 | POST | `/apply` | Queue `UpdateBonusTable` Catalyst job |
 | GET | `/apply-status` | Poll `Jobs` table for apply status |
-| GET | `/export-preview` | Export bonus preview CSV |
+| GET | `/export-preview` | Export bonus preview CSV (`VIRTUAL_CODE`, `ACTUAL_CODE`, holdings, bonus shares, delta) |
 
 #### `/api/dividend`
 
@@ -343,7 +344,7 @@ The largest backend file (~1067 lines). End-to-end flow:
 7. **On success** (poll or callback → `completeTxnUploadPipeline`), queue **3 downstream jobs** with **10s delay** between each (reduces Dev COMPONENT concurrency burst):
 
 ```
-UpdatesSecurity_ClientMasters  → sync clientIds + Security_List + enrich Transaction
+UpdatesSecurity_ClientMasters  → unique-accounts/isins JSON on Stratus → clientIds + Security_List stubs
   (wait 10s)
 CalculateHoldingMaster         → sliding-window fan-out CalculateHoldingWorkers (≤10 in-flight, baton-pass if needed)
   (wait 10s)
@@ -390,7 +391,7 @@ req.catalystApp.jobScheduling().JOB.submitJob({
 
 | Job Pool | Functions triggered |
 |----------|---------------------|
-| **UpdateMasters** | `UpdatesSecurity_ClientMasters`, `CalculateHoldingMaster`, `Cal_CB_Append_TxnUpload`, `HoldingUpdateManually`, `UpdateISIN` |
+| **UpdateMasters** | `UpdatesSecurity_ClientMasters`, `EnrichTransactionSecurity`, `CalculateHoldingMaster`, `Cal_CB_Append_TxnUpload`, `HoldingUpdateManually`, `UpdateISIN` |
 | **CorporateActions** | `UpdateBonusTable`, `MegerFn`, `DemergerFn`, `RebuildHoldingtable` |
 | **Export** | `ExportAllCustomerHoldingData`, `ExportDividendAccounts`, `ExportCashBalance`, `ExportCashBalSingleClient` |
 | **Finance** | `CashCalculation` |
@@ -640,6 +641,10 @@ Four tabs: Holding, Allocation, Performance, Transaction.
 5. **Split** applies synchronously (no job poll).
 6. **Export preview** available on Split/Bonus (CSV download).
 
+**ISIN search:** Split / Bonus / Demerger filter with null-safe `String(field ?? "").toLowerCase()` so rows with null `ISIN` / `Security_Code` / `Security_Name` (e.g. CASH stubs in `Security_List`) do not throw `Cannot read properties of null (reading 'toLowerCase')`. Dropdown keys use `` `${isin || "no-isin"}-${idx}` ``. Dividend and Merger already used optional chaining / `String(...?? "")`.
+
+**Split / Bonus preview columns:** Virtual Code (`accountCode` = `WS_Account_code` from Holdings) and Actual Code (`actualCode` from `clientIds` via `util/mapVirtualToActualCodes.js`, per-code lookup preferring non-empty `Actual_Code` when duplicate rows exist). Same columns appear in Split/Bonus **export-preview** CSVs (`VIRTUAL_CODE`, `ACTUAL_CODE`). Demerger/Merger/Dividend previews unchanged.
+
 **Dividend-specific:** Requires custodian Benefit Collection Report CSV on preview. Shows reconciliation status chips (matched/mismatch/partial). Client-side CSV export of reconciliation grid. `applyMode` and optional `accountCodes` sent on apply.
 
 **Merger-specific:** Multi old-company ISIN input, merge-into new company fields, lot-level preview table with `willSkip` flags.
@@ -766,6 +771,7 @@ functions/
 ├── RebuildHoldingtable/        # Full FIFO rebuild (corp actions) + holdingsRebuildFromSources.js
 ├── HoldingUpdateManually/        # Manual full rebuild (API trigger)
 ├── UpdatesSecurity_ClientMasters/ # Job: sync clientIds + Security_List from CSV
+├── EnrichTransactionSecurity/    # Job: Security_List → Transaction code/name enrich
 ├── UpdateSecurity_ClientMaster/  # Event: Stratus trigger twin of above
 ├── Cal_CB_Append_TxnUpload/      # Incremental cash passbook after upload
 ├── Cal_CB_Per_TNX/               # Full cash passbook rebuild per account
@@ -792,13 +798,15 @@ functions/
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  TRANSACTION UPLOAD (bulk write poll or callback from AppSail)          │
 │                                                                         │
-│  UpdatesSecurity_ClientMasters ──► clientIds + Security_List + enrich   │
-│         │                                                               │
-│         ├──► CalculateHoldingMaster ──► CalculateHoldingWorkers (×N)    │
-│         │         (chunks of 200 pairs)    incremental Holdings append  │
-│         │                                                               │
-│         └──► Cal_CB_Append_TxnUpload ──► self-continues with lastAccount│
-│                  incremental Cash_Balance_Per_Transaction append        │
+│  UpdatesSecurity_ClientMasters ──► unique-accounts/isins JSON → clientIds + Security_List stubs │
+│         │                                                                                       │
+│         └──► EnrichTransactionSecurity (ISIN list → Security_List → UPDATE Transaction)         │
+│                                                                                                 │
+│         ├──► CalculateHoldingMaster ──► CalculateHoldingWorkers (×N)                            │
+│         │         (chunks of 200 pairs)    incremental Holdings append                          │
+│         │                                                                                       │
+│         └──► Cal_CB_Append_TxnUpload ──► self-continues with lastAccount                        │
+│                  incremental Cash_Balance_Per_Transaction append                                │
 └─────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -846,11 +854,27 @@ Triggered by AppSail `handleBulkCallback` after `Transaction` bulk write complet
 
 **Flow:**
 1. Stream-parse the uploaded CSV from Stratus.
-2. Collect distinct `BROKERACID` (account codes) and `SYMBOLCODE` (ISINs).
-3. `INSERT` missing rows into `clientIds` and `Security_List` (ISIN-only stub if new).
-4. `UPDATE Transaction` rows where `Security_code`/`Security_Name` are blank, enriching from `Security_List` when both code and name exist.
+2. Collect distinct `BROKERACID` (account codes) and `SYMBOLCODE` (ISINs) in Sets (dedupe only).
+3. Write Stratus JSON source-of-truth files, then clear Sets from memory:
+   - `transactions-meta/unique-accounts-{stamp}.json`
+   - `transactions-meta/unique-isins-{stamp}.json`
+4. Reload those arrays from Stratus and bulk-insert stubs into `clientIds` (`WS_Account_code`) and `Security_List` (`ISIN` only).
+5. Transaction `Security_code` / `Security_Name` enrich is **not** done here — on success USCM queues **`EnrichTransactionSecurity`** with `isinsObjectKey` (+ `importStartedAtMs`, `lastIsin=""`).
 
 **Twin:** `UpdateSecurity_ClientMaster` is the **event-function** version — same logic but triggered by Stratus object events instead of job params. Upload path uses the job version; the event may still fire on the same Stratus upload (potential duplicate work).
+
+#### 1b. `EnrichTransactionSecurity` (job)
+
+**Params:** `bucketName`, `isinsObjectKey`, `importStartedAtMs`, `lastIsin`, `source=TxnUpload`
+
+**Flow:**
+1. Load unique ISINs from Stratus `transactions-meta/unique-isins-*.json`; sort ascending.
+2. Skip ISINs `<= lastIsin` (baton-pass cursor; empty on first run).
+3. Chunks of ~100: `SELECT` from `Security_List` via `WHERE ISIN IN (...)`.
+4. For each ISIN with both `Security_Code` and `Security_Name`, paged `UPDATE Transaction` (`Security_code` / `Security_Name`) where those fields are blank, scoped by `CREATEDTIME >= importFloor` when `importStartedAtMs` is set.
+5. Near ~60s remaining: re-queue self with `lastIsin` (baton-pass). Skip ISINs missing master code/name.
+
+**Pool:** `UpdateMasters`. Triggered by `UpdatesSecurity_ClientMasters` after master stubs complete (not by AppSail directly).
 
 #### 2. `CalculateHoldingMaster` → `CalculateHoldingWorkers` (orchestrator + slaves)
 
@@ -1077,7 +1101,8 @@ Scheduled cleanup: deletes `Jobs` rows with `CREATEDTIME` older than **10 days**
 | `CalculateHoldingPerAccount` | Manual / test | — | — | ✅ Full |
 | `RebuildHoldingtable` | Corp actions, ISIN | `CorporateActions` | — | ✅ Full |
 | `HoldingUpdateManually` | API `/holding-update` | `UpdateMasters` | — | ✅ Full |
-| `UpdatesSecurity_ClientMasters` | Bulk callback | `UpdateMasters` | — | ✅ Full |
+| `UpdatesSecurity_ClientMasters` | Bulk callback | `UpdateMasters` | `EnrichTransactionSecurity` | ✅ Full |
+| `EnrichTransactionSecurity` | USCM on success | `UpdateMasters` | Self (baton-pass) | ✅ Full |
 | `UpdateSecurity_ClientMaster` | Stratus event | — | — | ✅ Full |
 | `Cal_CB_Append_TxnUpload` | Bulk callback | `UpdateMasters` | Self (continuation) | ✅ Full |
 | `Cal_CB_Per_TNX` | Manual / cron | — | — | ✅ Full |
@@ -1244,7 +1269,7 @@ Deploys `react-app` (static client), `appsail-nodejs` (API), and all `functions/
 - **Architecture:** Upload holdings path (`CalculateHoldingWorkers`) is append-only and does not replay corporate actions; two cash systems (`Cash_Balance_Per_Transaction` vs `Cash_Ledger`) are not synchronized.
 - **Technical debt:** 3 duplicate FIFO engines in AppSail; duplicate `calculateHoldingsSummary`; orphan util modules; hardcoded account lists in `index.js` and `calculateBalanceOnce.js`; `diffLogic.js` in `ExportDifferentialReport` unused.
 - **Config:** CORS locked to `localhost:3000` (commented); `APPSAIL_BASE_URL` defaults to Catalyst AppSail URL (bulk-write callback); SQL via string interpolation (not parameterized).
-- **UI gaps:** Update ISIN does not poll job completion; legacy `TransactionUploadPage` not routed.
+- **UI gaps:** Update ISIN does not poll job completion; legacy `TransactionUploadPage` not routed. `Security_List` may contain null ISIN/code/name rows (e.g. CASH); Split/Bonus/Demerger ISIN dropdowns tolerate these via null-safe search filters.
 - **No automated tests** in backend, frontend, or functions.
 
 ---
