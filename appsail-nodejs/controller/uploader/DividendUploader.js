@@ -1,4 +1,4 @@
-import { runFifoEngine } from "../../util/analytics/transactionHistory/fifo.js";
+import { fetchHoldingsRowsForAccountIsin } from "../../util/analytics/holdingsFromTable.js";
 import { parseCustodianCsv } from "../../util/custodian/parseCustodianCsv.js";
 
 const ZCQL_ROW_LIMIT = 270;
@@ -305,119 +305,30 @@ export const getAllSecuritiesISINs = async (req, res) => {
       // we need to surface as "missing_in_system" for ops to investigate.
 
       /* ======================================================
-         STEP 2: FETCH TRANSACTIONS (<= RECORD DATE)
-         ====================================================== */
-      const txRows = [];
-      const seenTxnRowIds = new Set();
-      let txOffset = 0;
-
-      while (true) {
-        const batch = await zcql.executeZCQLQuery(`
-          SELECT *
-          FROM Transaction
-          WHERE ISIN='${isin}'
-          AND SETDATE <= '${recordDateISO}'
-          ORDER BY SETDATE ASC, ROWID ASC
-          LIMIT ${ZCQL_ROW_LIMIT} OFFSET ${txOffset}
-        `);
-
-        if (!batch || batch.length === 0) break;
-        for (const row of batch) {
-          const t = row.Transaction || row;
-          const rowId = t.ROWID;
-          if (rowId != null && seenTxnRowIds.has(rowId)) continue;
-          if (rowId != null) seenTxnRowIds.add(rowId);
-          txRows.push(row);
-        }
-        if (batch.length < ZCQL_ROW_LIMIT) break;
-        txOffset += ZCQL_ROW_LIMIT;
-      }
-
-      /* ======================================================
-         STEP 3: FETCH BONUSES (<= RECORD DATE)
-         ====================================================== */
-      const bonusRows = [];
-      let bonusOffset = 0;
-
-      while (true) {
-        const batch = await zcql.executeZCQLQuery(`
-          SELECT *
-          FROM Bonus
-          WHERE ISIN='${isin}'
-          AND ExDate <= '${recordDateISO}'
-          ORDER BY ExDate ASC, ROWID ASC
-          LIMIT ${ZCQL_ROW_LIMIT} OFFSET ${bonusOffset}
-        `);
-
-        if (!batch || batch.length === 0) break;
-        bonusRows.push(...batch);
-        if (batch.length < ZCQL_ROW_LIMIT) break;
-        bonusOffset += ZCQL_ROW_LIMIT;
-      }
-
-      /* ======================================================
-         STEP 4: FETCH SPLITS (<= RECORD DATE)
-         ====================================================== */
-      const splitRows = [];
-      let splitOffset = 0;
-
-      while (true) {
-        const batch = await zcql.executeZCQLQuery(`
-          SELECT *
-          FROM Split
-          WHERE ISIN='${isin}'
-          AND Issue_Date <= '${recordDateISO}'
-          ORDER BY Issue_Date ASC, ROWID ASC
-          LIMIT ${ZCQL_ROW_LIMIT} OFFSET ${splitOffset}
-        `);
-
-        if (!batch || batch.length === 0) break;
-        splitRows.push(...batch);
-        if (batch.length < ZCQL_ROW_LIMIT) break;
-        splitOffset += ZCQL_ROW_LIMIT;
-      }
-
-      /* ======================================================
-         STEP 5: GROUP DATA BY ACCOUNT
-         ====================================================== */
-      const txByAccount = {};
-      txRows.forEach((r) => {
-        const t = r.Transaction;
-        (txByAccount[t.WS_Account_code] ||= []).push(t);
-      });
-
-      const bonusByAccount = {};
-      bonusRows.forEach((r) => {
-        const b = r.Bonus;
-        (bonusByAccount[b.WS_Account_code] ||= []).push(b);
-      });
-
-      const splits = splitRows.map((r) => {
-        const s = r.Split;
-        return {
-          issueDate: s.Issue_Date,
-          ratio1: Number(s.Ratio1) || 0,
-          ratio2: Number(s.Ratio2) || 0,
-          isin: s.ISIN,
-        };
-      });
-
-      /* ======================================================
-         STEP 6: FIFO PREVIEW
+         STEP 2: HOLDING AS OF RECORD DATE (read materialised Holdings)
+         ------------------------------------------------------
+         Read the stored Holdings ledger — the same source of truth as the
+         rebuild / upload worker — as of the record date, instead of replaying
+         FIFO from the source tables. The last row in FIFO order carries the
+         running HOLDING (holding as of that date), and corporate actions
+         already applied (incl. demerger/merger) are reflected automatically.
          ====================================================== */
       const preview = [];
       const fifoByAccount = new Map();
 
       for (const accountCode of eligibleAccounts) {
-        const transactions = txByAccount[accountCode] || [];
-        if (!transactions.length) continue;
+        const holdingRows = await fetchHoldingsRowsForAccountIsin(
+          zcql,
+          accountCode,
+          isin,
+          recordDateISO,
+        );
+        if (!holdingRows.length) continue;
 
-        const bonuses = bonusByAccount[accountCode] || [];
+        const holdingAsOnRecordDate =
+          Number(holdingRows[holdingRows.length - 1].HOLDING) || 0;
+        if (holdingAsOnRecordDate <= 1e-6) continue;
 
-        const fifo = runFifoEngine(transactions, bonuses, splits, true);
-        if (!fifo || fifo.holdings <= 1e-6) continue;
-
-        const holdingAsOnRecordDate = fifo.holdings;
         const dividendAmount = round2(holdingAsOnRecordDate * rateNum);
 
         fifoByAccount.set(accountCode, {
