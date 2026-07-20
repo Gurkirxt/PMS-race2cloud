@@ -441,7 +441,7 @@ async function fetchAllHoldingsRowsForPair(zcql, accountCode, isin) {
     try {
       const batch = await zcql.executeZCQLQuery(`
         SELECT TRANSACTION_DATE, SETTLEMENT_DATE, TYPE, QUANTITY, PRICE,
-               HOLDING, WAP, HOLDING_VALUE, ROWID
+               HOLDING, WAP, HOLDING_VALUE, CA_DATE, ROWID
         FROM Holdings
         WHERE WS_Account_code = '${esc(accountCode)}' AND ISIN = '${esc(isin)}'
         ORDER BY CREATEDTIME ASC, ROWID ASC
@@ -491,10 +491,17 @@ function reconstructBuyQueueFromHoldings(rows) {
     const upper = type.toUpperCase();
     const qty = Number(r.QUANTITY) || 0;
     const price = Number(r.PRICE) || 0;
-    const date = String(r.TRANSACTION_DATE || "").trim();
+    // Group all lots of one corporate action together. DEMERGER/MERGER write a
+    // shared record date to CA_DATE while each surviving lot carries its own
+    // per-lot TRANSACTION_DATE, so keying by TRANSACTION_DATE would wipe the
+    // queue on every lot and keep only the last one. SPLIT writes no CA_DATE,
+    // so it falls back to TRANSACTION_DATE and behaves exactly as before.
+    const caDate = String(r.CA_DATE || "").trim();
+    const txnDate = String(r.TRANSACTION_DATE || "").trim();
+    const groupDate = caDate || txnDate;
 
     if (upper === "SPLIT" || upper === "DEMERGER" || upper === "MERGER") {
-      const key = `${upper}|${date}`;
+      const key = `${upper}|${groupDate}`;
       if (key !== lastReplaceKey) queue.length = 0;
       if (qty > 0) queue.push({ qty, price });
       lastReplaceKey = key;
