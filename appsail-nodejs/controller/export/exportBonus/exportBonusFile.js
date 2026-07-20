@@ -1,4 +1,4 @@
-import { runFifoEngine } from "../../../util/analytics/transactionHistory/fifo.js";
+import { fetchHoldingsRowsForAccountIsin } from "../../../util/analytics/holdingsFromTable.js";
 import { buildVirtualToActualMap } from "../../../util/mapVirtualToActualCodes.js";
 
 const BATCH_SIZE = 270;
@@ -55,89 +55,31 @@ export const exportBonusPreviewFile = async (req, res) => {
       eligibleAccounts,
     );
 
-    /* ================= FETCH TX / BONUS / SPLIT (ROWID dedupe) ================= */
-    const fetchAllDeduped = async (table, dateCol, orderBySql) => {
-      const out = [];
-      const seenRowIds = new Set();
-      let off = 0;
-      while (true) {
-        const r = await zcql.executeZCQLQuery(`
-          SELECT *
-          FROM ${table}
-          WHERE ISIN='${isin}' AND ${dateCol} <='${exDateISO}'
-          ORDER BY ${orderBySql}
-          LIMIT ${BATCH_SIZE} OFFSET ${off}
-        `);
-        if (!r.length) break;
-        for (const row of r) {
-          const rec = row[table] || row.Transaction || row.Bonus || row.Split || row;
-          const rowId = rec.ROWID;
-          if (rowId != null && seenRowIds.has(rowId)) continue;
-          if (rowId != null) seenRowIds.add(rowId);
-          out.push(row);
-        }
-        if (r.length < BATCH_SIZE) break;
-        off += BATCH_SIZE;
-      }
-      return out;
-    };
-
-    const txRows = await fetchAllDeduped(
-      "Transaction",
-      "SETDATE",
-      "SETDATE ASC, ROWID ASC"
-    );
-    const bonusRows = await fetchAllDeduped("Bonus", "ExDate", "ExDate ASC, ROWID ASC");
-    const splitRows = await fetchAllDeduped(
-      "Split",
-      "Issue_Date",
-      "Issue_Date ASC, ROWID ASC"
-    );
-
-    /* ================= GROUP ================= */
-    const txByAcc = {};
-    txRows.forEach(r => {
-      const t = r.Transaction;
-      (txByAcc[t.WS_Account_code] ||= []).push(t);
-    });
-
-    const bonusByAcc = {};
-    bonusRows.forEach(r => {
-      const b = r.Bonus;
-      (bonusByAcc[b.WS_Account_code] ||= []).push(b);
-    });
-
-    const splits = splitRows.map((r) => {
-      const s = r.Split;
-      return {
-        issueDate: s.Issue_Date,
-        ratio1: Number(s.Ratio1) || 0,
-        ratio2: Number(s.Ratio2) || 0,
-        isin: s.ISIN,
-      };
-    });
-
-    /* ================= FIFO + CSV ================= */
+    /* ================= HOLDING AS OF EX-DATE (read materialised Holdings) =================
+       Read the stored Holdings ledger — the same source of truth as the
+       rebuild / upload worker — as of the ex-date, instead of replaying FIFO
+       from the source tables. The last row in FIFO order carries the running
+       HOLDING (holding as of that date), and corporate actions already applied
+       (incl. demerger/merger) are reflected automatically. */
     for (const acc of eligibleAccounts) {
-      const tx = txByAcc[acc] || [];
-      if (!tx.length) continue;
+      const holdingRows = await fetchHoldingsRowsForAccountIsin(
+        zcql,
+        acc,
+        isin,
+        exDateISO,
+      );
+      const beforeHolding = holdingRows.length
+        ? Number(holdingRows[holdingRows.length - 1].HOLDING) || 0
+        : 0;
+      if (beforeHolding <= 1e-6) continue;
 
-      const bonuses = bonusByAcc[acc] || [];
-      const before = runFifoEngine(tx, bonuses, splits, true);
-      if (!before || before.holdings <= 1e-6) continue;
-
-      const bonusShares = Math.floor((before.holdings * r1) / r2);
+      const bonusShares = Math.floor((beforeHolding * r1) / r2);
       if (bonusShares <= 0) continue;
 
-      const after = runFifoEngine(
-        tx,
-        [...bonuses, { ISIN: isin, WS_Account_code: acc, BonusShare: bonusShares, ExDate: exDateISO }],
-        splits,
-        true
-      );
+      const afterHolding = beforeHolding + bonusShares;
 
       const actualCode = virtualToActual.get(acc) || "";
-      csv += `"${isin}","${acc}","${actualCode}","${before.holdings}","${bonusShares}","${after.holdings}","${after.holdings - before.holdings}"\n`;
+      csv += `"${isin}","${acc}","${actualCode}","${beforeHolding}","${bonusShares}","${afterHolding}","${afterHolding - beforeHolding}"\n`;
     }
 
     /* ================= UPLOAD ================= */
