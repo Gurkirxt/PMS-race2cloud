@@ -18,6 +18,10 @@ function HoldingsTab() {
   const [accountCode, setAccountCode] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [showDropdown, setShowDropdown] = useState(false);
+  const [isinOptions, setIsinOptions] = useState([]);
+  const [isinQuery, setIsinQuery] = useState("");
+  const [selectedIsin, setSelectedIsin] = useState("");
+  const [showIsinDropdown, setShowIsinDropdown] = useState(false);
   const [loading, setLoading] = useState(false);
   const [downloadUrl, setDownloadUrl] = useState("");
 
@@ -26,6 +30,7 @@ function HoldingsTab() {
   const isConsolidated = reportMode === "consolidated";
 
   const dropdownRef = useRef(null);
+  const isinDropdownRef = useRef(null);
   const exportJobsRef = useRef(exportJobs);
   exportJobsRef.current = exportJobs;
   // Consolidated mode lists Actual Codes; scheme-wise lists virtual codes.
@@ -40,12 +45,38 @@ function HoldingsTab() {
     setDownloadUrl("");
   };
 
+  const handleExportTypeChange = (type) => {
+    setExportType(type);
+    setDownloadUrl("");
+    setShowDropdown(false);
+    setShowIsinDropdown(false);
+    if (type !== "single") {
+      setSearchQuery("");
+      setAccountCode("");
+    }
+    if (type !== "isin") {
+      setIsinQuery("");
+      setSelectedIsin("");
+    }
+  };
+
   /* ---------------- FILTERED OPTIONS ---------------- */
   const filteredOptions = useMemo(() => {
     return clientOptions.filter((opt) =>
       opt.label.toLowerCase().includes(searchQuery.toLowerCase())
     );
   }, [clientOptions, searchQuery]);
+
+  const filteredIsinOptions = useMemo(() => {
+    const q = String(isinQuery ?? "").toLowerCase().trim();
+    if (!q) return isinOptions;
+    return isinOptions.filter(
+      (opt) =>
+        String(opt?.isin ?? "").toLowerCase().includes(q) ||
+        String(opt?.securityCode ?? "").toLowerCase().includes(q) ||
+        String(opt?.securityName ?? "").toLowerCase().includes(q)
+    );
+  }, [isinOptions, isinQuery]);
 
   const sortedExportJobs = useMemo(() => {
     return [...exportJobs].sort((a, b) => {
@@ -61,10 +92,39 @@ function HoldingsTab() {
       if (dropdownRef.current && !dropdownRef.current.contains(e.target)) {
         setShowDropdown(false);
       }
+      if (isinDropdownRef.current && !isinDropdownRef.current.contains(e.target)) {
+        setShowIsinDropdown(false);
+      }
     };
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
+
+  useEffect(() => {
+    if (exportType !== "isin") return;
+
+    const fetchSecurityList = async () => {
+      try {
+        const response = await fetch(`${BASE_URL}/security/list`);
+        const data = await response.json();
+        const rows = Array.isArray(data?.data) ? data.data : [];
+        setIsinOptions(
+          rows
+            .map((row) => ({
+              isin: String(row?.isin ?? "").trim(),
+              securityCode: String(row?.securityCode ?? "").trim(),
+              securityName: String(row?.securityName ?? "").trim(),
+            }))
+            .filter((row) => row.isin)
+        );
+      } catch (error) {
+        console.error("Failed to load securities list:", error);
+        setIsinOptions([]);
+      }
+    };
+
+    fetchSecurityList();
+  }, [exportType]);
 
   /* ---------------- ACCOUNT SELECT ---------------- */
   const handleAccountSelect = (option) => {
@@ -79,9 +139,52 @@ function HoldingsTab() {
     setShowDropdown(false);
   };
 
+  const handleIsinSelect = (option) => {
+    const label = option.securityName
+      ? `${option.isin} - ${option.securityName}`
+      : option.isin;
+    setIsinQuery(label);
+    setSelectedIsin(option.isin);
+    setShowIsinDropdown(false);
+  };
+
+  const clearIsinSelection = () => {
+    setIsinQuery("");
+    setSelectedIsin("");
+    setShowIsinDropdown(false);
+  };
+
   /* ===================== EXPORT HANDLER ===================== */
   const handleExport = async () => {
     try {
+      /* ---------- ISIN EXPORT (same shape as Analytics ISIN report) ---------- */
+      if (exportType === "isin") {
+        if (!selectedIsin) {
+          alert("Please select an ISIN");
+          return;
+        }
+
+        setLoading(true);
+        setDownloadUrl("");
+
+        const params = new URLSearchParams({ isin: selectedIsin });
+        if (asOnDate) params.append("asOnDate", asOnDate);
+
+        const response = await fetch(
+          `${BASE_URL}/export/export-by-isin?${params.toString()}`,
+          { method: "GET", credentials: "include" }
+        );
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.message);
+
+        const url =
+          data.downloadUrl?.signature || data.downloadUrl || "";
+        if (!url) throw new Error("Download URL missing from export response");
+        setDownloadUrl(url);
+        setLoading(false);
+        return;
+      }
+
       /* ---------- SINGLE CLIENT EXPORT ---------- */
       if (exportType === "single") {
         if (!accountCode) {
@@ -294,7 +397,7 @@ function HoldingsTab() {
           <input
             type="radio"
             checked={exportType === "all"}
-            onChange={() => setExportType("all")}
+            onChange={() => handleExportTypeChange("all")}
           />
           Export All Clients
         </label>
@@ -303,9 +406,18 @@ function HoldingsTab() {
           <input
             type="radio"
             checked={exportType === "single"}
-            onChange={() => setExportType("single")}
+            onChange={() => handleExportTypeChange("single")}
           />
           Export Single Client
+        </label>
+
+        <label>
+          <input
+            type="radio"
+            checked={exportType === "isin"}
+            onChange={() => handleExportTypeChange("isin")}
+          />
+          ISIN
         </label>
       </div>
 
@@ -366,6 +478,59 @@ function HoldingsTab() {
 
                 <div className="dropdown-footer">
                   {filteredOptions.length} of {clientOptions.length} options
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {exportType === "isin" && (
+          <div className="account-code-search" ref={isinDropdownRef}>
+            <label className="search-label">ISIN</label>
+
+            <div className="search-input-wrapper">
+              <span className="search-icon">🔍</span>
+
+              <input
+                type="text"
+                className="search-input"
+                placeholder="Search ISIN / Security..."
+                value={isinQuery}
+                onChange={(e) => {
+                  setIsinQuery(e.target.value);
+                  setShowIsinDropdown(true);
+                }}
+                onFocus={() => setShowIsinDropdown(true)}
+              />
+
+              {isinQuery && (
+                <span className="clear-icon" onClick={clearIsinSelection}>
+                  ✕
+                </span>
+              )}
+
+              <span className="arrow-icon">▾</span>
+            </div>
+
+            {showIsinDropdown && filteredIsinOptions.length > 0 && (
+              <div className="search-dropdown">
+                <div className="dropdown-header">Search ISIN / Name...</div>
+
+                <div className="dropdown-options">
+                  {filteredIsinOptions.map((opt, idx) => (
+                    <div
+                      key={`${opt.isin || "no-isin"}-${idx}`}
+                      className="dropdown-option"
+                      onClick={() => handleIsinSelect(opt)}
+                    >
+                      {opt.isin}
+                      {opt.securityName ? ` - ${opt.securityName}` : ""}
+                    </div>
+                  ))}
+                </div>
+
+                <div className="dropdown-footer">
+                  {filteredIsinOptions.length} of {isinOptions.length} options
                 </div>
               </div>
             )}

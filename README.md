@@ -139,6 +139,7 @@ appsail-nodejs/
 | GET | `/getAllAccountCodes` | Virtual account codes from `clientIds` |
 | GET | `/getAllActualCodes` | Distinct `Actual_Code` values (consolidated view) |
 | GET | `/getHoldingsSummarySimple` | Per-account holdings summary (qty, WAP, market value) |
+| GET | `/getHoldingsByIsin` | Cross-account ISIN report from `Holdings` (virtual/actual code, qty, WAP, values) |
 | GET | `/getPaginatedTransactions` | Paginated transaction ledger + corp-action rows |
 | GET | `/getSecurityNameOptions` | Security name dropdown options |
 | GET | `/getCashBalanceSummary` | Latest cash balance from `Cash_Ledger` |
@@ -248,6 +249,7 @@ appsail-nodejs/
 | GET | `/export-all` | Schedule all-clients holdings export job |
 | GET | `/export-single` | Sync single-client holdings CSV to Stratus |
 | GET | `/export-consolidated` | Consolidated holdings by `Actual_Code` |
+| GET | `/export-by-isin` | Sync ISIN holdings CSV (same rows as Analytics ISIN report: Virtual + Actual Code) |
 | GET | `/check-status` | Poll export-all job status |
 | GET | `/download` | Download export-all CSV |
 | GET | `/export-all/history` | Export-all history |
@@ -532,6 +534,7 @@ Summary cards, charts, and filter bar are **static/hardcoded** — no API.
 |----------|--------|---------|
 | `/analytics/getAllAccountCodes` | GET | `useAccountCodes` |
 | `/analytics/getHoldingsSummarySimple?accountCode&asOnDate` | GET | `useHoldings` |
+| `/analytics/getHoldingsByIsin?isin&asOnDate` | GET | `AnalyticsPage` ISIN report (all accounts holding selected ISIN) |
 | `/analytics/getCashBalanceSummary?accountCode&asOnDate` | GET | `AnalyticsPage` |
 | `/analytics/getPaginatedTransactions` | GET | `TransactionTab` |
 | `/analytics/getSecurityNameOptions` | GET | `TransactionTab` (ISIN filter) |
@@ -584,7 +587,7 @@ Summary cards, charts, and filter bar are **static/hardcoded** — no API.
 
 | Tab | Endpoints |
 |-----|-----------|
-| **Holdings** | `/export/export-single`, `/export/export-consolidated`, `/export/export-all`, `/export/export-all/history`, `/export/check-status` (poll 15s), `/export/download` |
+| **Holdings** | `/export/export-single`, `/export/export-consolidated`, `/export/export-by-isin`, `/export/export-all`, `/export/export-all/history`, `/export/check-status` (poll 15s), `/export/download` |
 | **Transactions** | `/export/transaction/export-single` |
 | **Cash** | `/cash-balance/export/history`, `/export/cash-all`, `/cash-balance/export`, `/export/cash-all/status`, `/cash-balance/export/status` (poll 15s), download URLs |
 | **Corporate Action** | `/export/corporate-action/history`, `/export/corporate-action/export` (blob download) |
@@ -626,11 +629,12 @@ Uses `MainLayout` with `SummaryCardsRow`, `ChartsRow`, `FiltersBar`, `RecentTrad
 
 Four tabs: Holding, Allocation, Performance, Transaction.
 
-1. User searches **Account Code** (searchable dropdown from `useAccountCodes`).
-2. Optional **as-on date** filter triggers `fetchHoldings` + `fetchCashBalance`.
-3. **Holding tab** shows summary table (Total / Equity / Cash %) and `HoldingsGrid` with All/Equity/Cash view modes. Clicking a row opens **`TransactionPage` modal**.
-4. **Transaction tab** shows paginated ledger with ISIN/security name filters.
-5. Holdings quantities are **type-aware** in `HoldingCards.js` / `TransactionPage.js`: normal transactions show real decimals (e.g. `5.533`), corporate-action rows keep `Math.floor` whole numbers.
+1. User can search by **ISIN** (cross-account report) or **Account Code** (existing per-account holdings).
+2. Optional **as-on date** filter applies to both modes.
+3. **ISIN mode (Holding tab):** shows all accounts holding the selected ISIN with Virtual Code, Actual Code, Quantity, WAP, Holding Value, Last Price, Market Value (from `Holdings` + `clientIds` + `Bhav_Copy`). Clicking a row / View opens the same **`TransactionPage` modal** for that virtual account + ISIN.
+4. **Account mode (Holding tab):** shows summary table (Total / Equity / Cash %) and `HoldingsGrid` with All/Equity/Cash view modes. Clicking a row opens **`TransactionPage` modal**.
+5. **Transaction tab** remains account-code-driven and shows paginated ledger with ISIN/security name filters.
+6. Holdings quantities are **type-aware** in `HoldingCards.js` / `TransactionPage.js`: normal transactions show real decimals (e.g. `5.533`), corporate-action rows keep `Math.floor` whole numbers.
 
 #### Corporate Action Pages (common pattern)
 
@@ -698,6 +702,7 @@ Holdings export (Reports):
 Analytics drill-down:
   Select account → holdings grid → click row → TransactionPage modal
   → parallel fetch history + buy/sell totals
+  (same modal from ISIN report: click account row → history for that virtual code + ISIN)
 ```
 
 ### Styling & Dependencies
@@ -1214,6 +1219,10 @@ User fills form → Preview (POST) → table of affected accounts
 User selects date + mode → GET /export/export-all
   → Catalyst ExportAllCustomerHoldingData builds CSV → Stratus
   → UI polls /export/check-status → downloads presigned URL
+
+ISIN export (same as Analytics ISIN report):
+  Select ISIN (+ optional as-on date) → GET /export/export-by-isin
+  → CSV: VIRTUAL_CODE, ACTUAL_CODE, QUANTITY, WAP, HOLDING_VALUE, LAST_PRICE, MARKET_VALUE
 ```
 
 ### 4. Analytics View

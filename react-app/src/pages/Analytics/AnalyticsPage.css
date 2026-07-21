@@ -60,7 +60,7 @@
 /* Filters Layout */
 .filters-grid {
   display: grid;
-  grid-template-columns: 1.5fr 1fr;
+  grid-template-columns: 1.5fr 1.5fr 1fr;
   gap: 24px;
   width: 100%;
   align-items: flex-start;
@@ -141,7 +141,26 @@
 .account-code-search {
   position: relative;
   width: 100%;
-  z-index: 101;
+  z-index: 1;
+}
+
+/* ISIN Search */
+.isin-code-search {
+  position: relative;
+  width: 100%;
+  z-index: 1;
+}
+
+/* Raise active filter above siblings so dropdown covers adjacent fields */
+.isin-code-search.is-open,
+.account-code-search.is-open {
+  z-index: 200;
+}
+
+/* Hide Account Code while ISIN suggestions are open */
+.filters-grid.isin-dropdown-active .account-code-search {
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .search-label {
@@ -247,11 +266,11 @@
   top: calc(100% + 8px);
   left: 0;
   right: 0;
-  background: white;
+  background: #ffffff;
   border: 2px solid #e5e7eb;
   border-radius: 12px;
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.12);
-  z-index: 10000;
+  z-index: 210;
   animation: slideDown 0.2s ease;
 }
 

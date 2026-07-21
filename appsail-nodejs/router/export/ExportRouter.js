@@ -1,6 +1,7 @@
 import express from "express";
 import { exportDataPerAccount } from "../../controller/export/exportHolding/exportSingleClientHolding.js";
 import { exportConsolidatedPerActual } from "../../controller/export/exportHolding/exportConsolidatedHolding.js";
+import { exportHoldingsByIsin } from "../../controller/export/exportHolding/exportByIsin.js";
 import {
   exportAllData,
   getExportAllJobStatus,
@@ -24,6 +25,7 @@ const router = express.Router();
 router.get("/export-all", exportAllData);
 router.get("/export-single", exportDataPerAccount);
 router.get("/export-consolidated", exportConsolidatedPerActual);
+router.get("/export-by-isin", exportHoldingsByIsin);
 router.get("/check-status", getExportAllJobStatus);
 router.get("/download", downloadExportFile);
 router.get("/export-all/history", getExportAllHistory);
