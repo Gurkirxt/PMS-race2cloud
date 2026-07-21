@@ -2,6 +2,7 @@ import Express from "express";
 import {
   getAllAccountCodes,
   getAllActualCodes,
+  getHoldingsByIsin,
   getHoldingsSummarySimple,
 } from "../controller/analytics/tabs/holding/AnalyticsControllers.js";
 import {
@@ -14,6 +15,7 @@ const router = Express.Router();
 router.get("/getAllAccountCodes", getAllAccountCodes);
 router.get("/getAllActualCodes", getAllActualCodes);
 router.get("/getHoldingsSummarySimple", getHoldingsSummarySimple);
+router.get("/getHoldingsByIsin", getHoldingsByIsin);
 router.get("/getPaginatedTransactions", getPaginatedTransactions);
 router.get("/getSecurityNameOptions", getSecurityNameOptions);
 router.get("/getCashBalanceSummary", getCashBalanceSummary);

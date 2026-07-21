@@ -22,6 +22,12 @@ function AnalyticsPage() {
   const [accountCode, setAccountCode] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [showDropdown, setShowDropdown] = useState(false);
+  const [isinOptions, setIsinOptions] = useState([]);
+  const [isinQuery, setIsinQuery] = useState("");
+  const [selectedIsin, setSelectedIsin] = useState("");
+  const [showIsinDropdown, setShowIsinDropdown] = useState(false);
+  const [isinHoldings, setIsinHoldings] = useState([]);
+  const [loadingIsinHoldings, setLoadingIsinHoldings] = useState(false);
   const [asOnDate, setAsOnDate] = useState("");
 
   const [activeTab, setActiveTab] = useState("holding");
@@ -34,17 +40,29 @@ function AnalyticsPage() {
   const [cashBalance, setCashBalance] = useState(0);
 
   const dropdownRef = useRef(null);
+  const isinDropdownRef = useRef(null);
   const cashRequestIdRef = useRef(0);
+  const isinRequestIdRef = useRef(0);
   /* -------------------- EFFECTS -------------------- */
   useEffect(() => {
     const handleClickOutside = (e) => {
       if (dropdownRef.current && !dropdownRef.current.contains(e.target)) {
         setShowDropdown(false);
       }
+      if (
+        isinDropdownRef.current &&
+        !isinDropdownRef.current.contains(e.target)
+      ) {
+        setShowIsinDropdown(false);
+      }
     };
 
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
+  useEffect(() => {
+    fetchSecurityList();
   }, []);
 
   /* -------------------- DERIVED DATA -------------------- */
@@ -53,6 +71,17 @@ function AnalyticsPage() {
       opt.label.toLowerCase().includes(searchQuery.toLowerCase())
     );
   }, [clientOptions, searchQuery]);
+
+  const filteredIsinOptions = useMemo(() => {
+    const q = String(isinQuery ?? "").toLowerCase().trim();
+    if (!q) return isinOptions;
+    return isinOptions.filter(
+      (opt) =>
+        String(opt?.isin ?? "").toLowerCase().includes(q) ||
+        String(opt?.securityCode ?? "").toLowerCase().includes(q) ||
+        String(opt?.securityName ?? "").toLowerCase().includes(q)
+    );
+  }, [isinOptions, isinQuery]);
 
   function formatAmount(value) {
     if (value === null || value === undefined) return "–";
@@ -127,6 +156,7 @@ function AnalyticsPage() {
   /* -------------------- HANDLERS -------------------- */
   const handleSearchChange = (e) => {
     setSearchQuery(e.target.value);
+    setShowIsinDropdown(false);
     setShowDropdown(true);
   };
 
@@ -134,8 +164,34 @@ function AnalyticsPage() {
     setSearchQuery(option.label);
     setAccountCode(option.value);
     setShowDropdown(false);
+    setSelectedIsin("");
+    setIsinQuery("");
+    setIsinHoldings([]);
+    setCurrentPage(1);
     fetchHoldings(option.value, asOnDate);
     fetchCashBalance(option.value, asOnDate);
+  };
+
+  const handleIsinSearchChange = (e) => {
+    setIsinQuery(e.target.value);
+    setShowDropdown(false);
+    setShowIsinDropdown(true);
+  };
+
+  const handleIsinSelect = (option) => {
+    const label = option.securityName
+      ? `${option.isin} - ${option.securityName}`
+      : option.isin;
+    setIsinQuery(label);
+    setSelectedIsin(option.isin);
+    setShowIsinDropdown(false);
+    setSearchQuery("");
+    setAccountCode("");
+    setCashBalance(0);
+    setHoldings([]);
+    setSelectedStock(null);
+    setCurrentPage(1);
+    fetchHoldingsByIsin(option.isin, asOnDate);
   };
 
   const clearAccountSelection = () => {
@@ -143,6 +199,14 @@ function AnalyticsPage() {
     setAccountCode("");
     setHoldings([]);
     setSelectedStock(null);
+    setCashBalance(0);
+  };
+
+  const clearIsinSelection = () => {
+    setIsinQuery("");
+    setSelectedIsin("");
+    setIsinHoldings([]);
+    setCurrentPage(1);
   };
 
   const handleDateChange = (e) => {
@@ -150,6 +214,9 @@ function AnalyticsPage() {
     setAsOnDate(date);
     setCurrentPage(1);
 
+    if (selectedIsin) {
+      fetchHoldingsByIsin(selectedIsin, date);
+    }
     if (accountCode) {
       fetchHoldings(accountCode, date);
       fetchCashBalance(accountCode, date);
@@ -187,6 +254,60 @@ function AnalyticsPage() {
     }
   };
 
+  const fetchSecurityList = async () => {
+    try {
+      const response = await fetch(`${BASE_URL}/security/list`);
+      const data = await response.json();
+      const rows = Array.isArray(data?.data) ? data.data : [];
+      setIsinOptions(
+        rows
+          .map((row) => ({
+            isin: String(row?.isin ?? "").trim(),
+            securityCode: String(row?.securityCode ?? "").trim(),
+            securityName: String(row?.securityName ?? "").trim(),
+          }))
+          .filter((row) => row.isin)
+      );
+    } catch (error) {
+      console.error("Error fetching securities list:", error);
+      setIsinOptions([]);
+    }
+  };
+
+  const fetchHoldingsByIsin = async (isin, asOnDateValue) => {
+    const isinTrim = String(isin ?? "").trim();
+    if (!isinTrim) return;
+
+    const currentRequestId = ++isinRequestIdRef.current;
+    setLoadingIsinHoldings(true);
+    setIsinHoldings([]);
+
+    try {
+      const params = new URLSearchParams({ isin: isinTrim });
+      if (asOnDateValue) params.set("asOnDate", asOnDateValue);
+
+      const response = await fetch(
+        `${BASE_URL}/analytics/getHoldingsByIsin?${params.toString()}`
+      );
+      const data = await response.json();
+
+      if (currentRequestId !== isinRequestIdRef.current) return;
+      if (Array.isArray(data)) {
+        setIsinHoldings(data);
+      } else {
+        setIsinHoldings([]);
+      }
+    } catch (error) {
+      if (currentRequestId !== isinRequestIdRef.current) return;
+      console.error("Error fetching ISIN holdings:", error);
+      setIsinHoldings([]);
+    } finally {
+      if (currentRequestId === isinRequestIdRef.current) {
+        setLoadingIsinHoldings(false);
+      }
+    }
+  };
+
   /* -------------------- TABS CONFIG -------------------- */
   const TAB_ITEMS = [
     { key: "holding", label: "Holding" },
@@ -204,6 +325,10 @@ function AnalyticsPage() {
             setViewMode={setViewMode}
             holdings={holdings}
             accountCode={accountCode}
+            isIsinMode={Boolean(selectedIsin)}
+            isinReportRows={isinHoldings}
+            loadingIsinReport={loadingIsinHoldings}
+            selectedIsin={selectedIsin}
             asOnDate={asOnDate}
             selectedStock={selectedStock}
             setSelectedStock={setSelectedStock}
@@ -233,8 +358,67 @@ function AnalyticsPage() {
     <MainLayout title="Analytics Filters">
       {/* Filters */}
       <Card className="filters-card">
-        <div className="filters-grid">
-          <div className="account-code-search" ref={dropdownRef}>
+        <div
+          className={`filters-grid${
+            showIsinDropdown && filteredIsinOptions.length > 0
+              ? " isin-dropdown-active"
+              : ""
+          }`}
+        >
+          <div
+            className={`isin-code-search${showIsinDropdown ? " is-open" : ""}`}
+            ref={isinDropdownRef}
+          >
+            <label className="search-label">ISIN</label>
+
+            <div className="search-input-wrapper">
+              <span className="search-icon">🔍</span>
+              <input
+                type="text"
+                className="search-input"
+                placeholder="Search ISIN / Security..."
+                value={isinQuery}
+                onChange={handleIsinSearchChange}
+                onFocus={() => {
+                  setShowDropdown(false);
+                  setShowIsinDropdown(true);
+                }}
+              />
+
+              {isinQuery && (
+                <span className="clear-icon" onClick={clearIsinSelection}>
+                  ✕
+                </span>
+              )}
+              <span className="arrow-icon">▾</span>
+            </div>
+
+            {showIsinDropdown && filteredIsinOptions.length > 0 && (
+              <div className="search-dropdown">
+                <div className="dropdown-header">Search ISIN / Name...</div>
+                <div className="dropdown-options">
+                  {filteredIsinOptions.map((opt, idx) => (
+                    <div
+                      key={`${opt.isin || "no-isin"}-${idx}`}
+                      className="dropdown-option"
+                      onClick={() => handleIsinSelect(opt)}
+                    >
+                      {opt.isin}
+                      {opt.securityName ? ` - ${opt.securityName}` : ""}
+                    </div>
+                  ))}
+                </div>
+                <div className="dropdown-footer">
+                  {filteredIsinOptions.length} of {isinOptions.length} options
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div
+            className={`account-code-search${showDropdown ? " is-open" : ""}`}
+            ref={dropdownRef}
+          >
             <label className="search-label">Account Code</label>
 
             <div className="search-input-wrapper">
@@ -246,7 +430,10 @@ function AnalyticsPage() {
                 placeholder="Search Account Code..."
                 value={searchQuery}
                 onChange={handleSearchChange}
-                onFocus={() => setShowDropdown(true)}
+                onFocus={() => {
+                  setShowIsinDropdown(false);
+                  setShowDropdown(true);
+                }}
               />
 
               {searchQuery && (
@@ -303,7 +490,7 @@ function AnalyticsPage() {
         ))}
       </div>
       {/* Holding Summary – only for Holding tab, once an account is selected */}
-      {activeTab === "holding" && accountCode && (
+      {activeTab === "holding" && accountCode && !selectedIsin && (
         <div className="holding-summary-table">
           <div className="summary-table-header">
             <h3>Holding Summary</h3>
@@ -350,13 +537,15 @@ function AnalyticsPage() {
       {/* Tab Content */}
       <div className="analytics-tab-content">{renderActiveTab()}</div>
 
-      {loadingHoldings && <p className="loading-text">Loading holdings...</p>}
+      {loadingHoldings && !selectedIsin && (
+        <p className="loading-text">Loading holdings...</p>
+      )}
 
       {selectedStock && (
         <TransactionPage
-          key={`${selectedStock.securityCode}-${asOnDate}`}
+          key={`${selectedStock.accountCode || accountCode}-${selectedStock.isin || selectedStock.securityCode}-${asOnDate}`}
           stock={selectedStock}
-          accountCode={accountCode}
+          accountCode={selectedStock.accountCode || accountCode}
           asOnDate={asOnDate}
           onClose={() => setSelectedStock(null)}
         />
