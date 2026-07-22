@@ -3,3 +3,4 @@ Transaction.csv
 clientids.csv
 catalyst-debug.log
 text.txt
+/node_modules
