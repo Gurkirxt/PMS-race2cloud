@@ -37,7 +37,13 @@
       "CalculateHoldingMaster",
       "HoldingUpdateManually",
       "UpdateISINWorker",
-      "EnrichTransactionSecurity"
+      "EnrichTransactionSecurity",
+      "UpdateCBPerClient",
+      "CalculateHoldingsPerAccount",
+      "ExportDemergerReport",
+      "ExportMergerReport",
+      "GenerateComparsionReport",
+      "ExportCorpActionReport"
     ],
     "ignore": [],
     "source": "functions"

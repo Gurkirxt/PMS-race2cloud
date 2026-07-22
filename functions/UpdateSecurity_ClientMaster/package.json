@@ -1,0 +1,7 @@
+{
+  "main": "index.js",
+  "dependencies": {
+    "csv-parser": "^3.0.0",
+    "zcatalyst-sdk-node": "^3.1.1"
+  }
+}
