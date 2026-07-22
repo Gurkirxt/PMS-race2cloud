@@ -78,6 +78,16 @@ export const exportAllData = async (req, res) => {
         if (!isConsolidated(mode)) {
           try { await bucket.deleteObject(`all-clients-export-${dateStr}.csv`); } catch (_) { }
         }
+        // Baton-pass checkpoint/manifest/pending-buffer artifacts for this job
+        // (see functions/ExportAllCustomerHoldingData/checkpoint.js key naming)
+        const metaKeys = [
+          `exports-meta/${jobName}-manifest.json`,
+          `exports-meta/${jobName}-checkpoint.json`,
+          `exports-meta/${jobName}-pending.csv`,
+        ];
+        for (const key of metaKeys) {
+          try { await bucket.deleteObject(key); } catch (_) { }
+        }
       } catch (stratusErr) {
         console.error("Error deleting old file from Stratus:", stratusErr);
       }
