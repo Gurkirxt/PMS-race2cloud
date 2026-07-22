@@ -17,6 +17,7 @@ import {
   startCaImpactReport,
   getCaImpactStatus,
   downloadCaImpactReport,
+  getCaImpactHistory,
 } from "../../controller/export/exportCorporateAction/exportCaImpactReport.js";
 import {
   exportAllClientsCash,
@@ -50,5 +51,6 @@ router.get("/corporate-action/history", getCorporateActionHistory);
 router.get("/corporate-action/report/export", startCaImpactReport);
 router.get("/corporate-action/report/status", getCaImpactStatus);
 router.get("/corporate-action/report/download", downloadCaImpactReport);
+router.get("/corporate-action/report/history", getCaImpactHistory);
 
 export default router;

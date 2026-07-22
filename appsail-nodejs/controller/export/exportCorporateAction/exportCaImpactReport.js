@@ -220,6 +220,67 @@ export const getCaImpactStatus = async (req, res) => {
 };
 
 /* ============================================================
+   HISTORY — last N jobs for a given report type
+   ============================================================ */
+export const getCaImpactHistory = async (req, res) => {
+  try {
+    if (!req.catalystApp) {
+      return res.status(500).json([]);
+    }
+
+    const type = normType(req.query.type);
+    if (!SUPPORTED_TYPES.has(type)) {
+      return res.status(400).json([]);
+    }
+
+    const limit = Math.min(parseInt(req.query.limit, 10) || 10, 20);
+    const zcql = req.catalystApp.zcql();
+    const prefix = `CARPT_${type.toUpperCase()}_`;
+
+    const rows = await zcql.executeZCQLQuery(
+      `SELECT jobName, status, CREATEDTIME FROM Jobs WHERE jobName LIKE '${esc(prefix)}*' ORDER BY ROWID DESC LIMIT ${limit}`
+    );
+
+    const now = Date.now();
+    const jobs = [];
+
+    for (const row of rows) {
+      const jobName = row.Jobs.jobName;
+      let status = row.Jobs.status;
+      const createdAtMs = parseCatalystTime(row.Jobs.CREATEDTIME);
+
+      // jobName shape: CARPT_<TYPE>_<fromISO>_<toISO>
+      const rest = jobName.startsWith(prefix) ? jobName.slice(prefix.length) : jobName;
+      const [fromDate = "", toDate = ""] = rest.split("_");
+
+      if ((status === "PENDING" || status === "RUNNING") && now - createdAtMs > STALE_TIMEOUT_MS) {
+        try {
+          await zcql.executeZCQLQuery(
+            `UPDATE Jobs SET status = 'ERROR' WHERE jobName = '${esc(jobName)}'`
+          );
+        } catch (updateErr) {
+          console.error(`Failed to mark stale job ${jobName} as ERROR:`, updateErr);
+        }
+        status = "ERROR";
+      }
+
+      jobs.push({
+        jobName,
+        fromDate,
+        toDate,
+        status,
+        createdAt: createdAtMs > 0 ? new Date(createdAtMs).toISOString() : new Date().toISOString(),
+      });
+    }
+
+    return res.json(jobs);
+  } catch (err) {
+    console.error("CA IMPACT REPORT HISTORY ERROR:", err);
+    return res.status(500).json([]);
+  }
+};
+
+/* ============================================================
    DOWNLOAD — signed URL once COMPLETED
    ============================================================ */
 export const downloadCaImpactReport = async (req, res) => {

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import { BASE_URL } from "../../../constant.js";
 
 /* Individual per-client impact reports. Only `split` is wired to a backend
@@ -12,7 +12,22 @@ const INDIVIDUAL_TYPES = [
   { key: "demerger", label: "Demerger", supported: false },
 ];
 
-const isPollingStatus = (s) => s === "PENDING" || s === "RUNNING";
+const TERMINAL_STATUSES = ["COMPLETED", "FAILED", "ERROR", "NO_DATA"];
+const isPollingStatus = (s) => !TERMINAL_STATUSES.includes(s);
+
+/** Local wall time as yyyy-mm-dd HH:mm:ss (not locale-specific). */
+function formatExportTimestamp(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function statusBadgeClass(status) {
+  if (status === "COMPLETED") return "completed";
+  if (status === "FAILED" || status === "ERROR") return "failed";
+  return "pending";
+}
 
 function CorporateActionTab() {
   /* ---------- SHARED ---------- */
@@ -25,13 +40,22 @@ function CorporateActionTab() {
   const [exportHistory, setExportHistory] = useState([]);
 
   /* ---------- INDIVIDUAL IMPACT REPORT (async job) ---------- */
-  const [impactJob, setImpactJob] = useState(null); // { type, fromDate, toDate }
-  const [impactStatus, setImpactStatus] = useState(null);
-  const [impactDownloadUrl, setImpactDownloadUrl] = useState("");
+  const [impactJobs, setImpactJobs] = useState([]);
   const [impactError, setImpactError] = useState("");
   const [generating, setGenerating] = useState(false);
 
+  const impactJobsRef = useRef(impactJobs);
+  impactJobsRef.current = impactJobs;
+
   const selectedType = INDIVIDUAL_TYPES.find((t) => t.key === reportMode);
+
+  const sortedImpactJobs = useMemo(() => {
+    return [...impactJobs].sort((a, b) => {
+      const ta = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      const tb = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      return tb - ta;
+    });
+  }, [impactJobs]);
 
   /* ---------- LOAD LAST 10 "ALL" EXPORTS (ON MOUNT) ---------- */
   useEffect(() => {
@@ -50,44 +74,66 @@ function CorporateActionTab() {
     fetchHistory();
   }, []);
 
-  /* ---------- POLL IMPACT REPORT JOB STATUS ---------- */
+  /* ---------- LOAD IMPACT REPORT HISTORY (ON MOUNT / TYPE CHANGE) ---------- */
   useEffect(() => {
-    if (!impactJob || !isPollingStatus(impactStatus)) return;
+    if (!selectedType || !selectedType.supported) return;
 
-    const params = new URLSearchParams({
-      type: impactJob.type,
-      fromDate: impactJob.fromDate,
-      toDate: impactJob.toDate,
-    });
-
-    const interval = setInterval(async () => {
+    const fetchImpactHistory = async () => {
       try {
+        const params = new URLSearchParams({ type: reportMode, limit: "10" });
         const res = await fetch(
-          `${BASE_URL}/export/corporate-action/report/status?${params.toString()}`,
+          `${BASE_URL}/export/corporate-action/report/history?${params.toString()}`,
           { credentials: "include" }
         );
         const data = await res.json();
-        if (!data.success) return;
-
-        setImpactStatus(data.status);
-
-        if (data.status === "COMPLETED") {
-          clearInterval(interval);
-          fetchImpactDownload(impactJob);
-        } else if (data.status === "NO_DATA") {
-          clearInterval(interval);
-        } else if (data.status === "FAILED" || data.status === "ERROR") {
-          clearInterval(interval);
-          setImpactError("Report generation failed. Please try again.");
-        }
-      } catch {
-        // ignore transient polling errors
+        if (Array.isArray(data)) setImpactJobs(data);
+      } catch (err) {
+        console.error("Failed to load impact report history", err);
       }
-    }, 5000);
+    };
+    fetchImpactHistory();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reportMode]);
+
+  /* ---------- POLL IMPACT REPORT JOB STATUSES ---------- */
+  useEffect(() => {
+    if (!selectedType || !selectedType.supported) return;
+
+    const interval = setInterval(async () => {
+      const currentJobs = impactJobsRef.current;
+      const hasPending = currentJobs.some((j) => isPollingStatus(j.status));
+      if (!hasPending) return;
+
+      const updated = await Promise.all(
+        currentJobs.map(async (job) => {
+          if (!isPollingStatus(job.status)) return job;
+
+          try {
+            const params = new URLSearchParams({
+              type: reportMode,
+              fromDate: job.fromDate,
+              toDate: job.toDate,
+            });
+            const res = await fetch(
+              `${BASE_URL}/export/corporate-action/report/status?${params.toString()}`,
+              { credentials: "include" }
+            );
+            const data = await res.json();
+            if (!data.success || !data.status || data.status === "NOT_STARTED") {
+              return job;
+            }
+            return { ...job, status: data.status };
+          } catch {
+            return job;
+          }
+        })
+      );
+
+      setImpactJobs(updated);
+    }, 15000);
 
     return () => clearInterval(interval);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [impactJob, impactStatus]);
+  }, [reportMode, selectedType]);
 
   /* ---------- HANDLERS: "ALL" MODE ---------- */
   const handleExport = async () => {
@@ -120,7 +166,12 @@ function CorporateActionTab() {
       );
 
       setExportHistory((prev) => [
-        { fromDate, toDate, requestedAt: new Date().toISOString() },
+        {
+          fromDate,
+          toDate,
+          status: "COMPLETED",
+          createdAt: new Date().toISOString(),
+        },
         ...prev.slice(0, 9),
       ]);
     } catch (error) {
@@ -154,10 +205,6 @@ function CorporateActionTab() {
   /* ---------- HANDLERS: INDIVIDUAL IMPACT REPORT ---------- */
   const handleModeChange = (e) => {
     setReportMode(e.target.value);
-    // Reset any in-flight/finished impact report when switching report type.
-    setImpactJob(null);
-    setImpactStatus(null);
-    setImpactDownloadUrl("");
     setImpactError("");
   };
 
@@ -172,7 +219,6 @@ function CorporateActionTab() {
     }
 
     setImpactError("");
-    setImpactDownloadUrl("");
     setGenerating(true);
 
     try {
@@ -185,8 +231,29 @@ function CorporateActionTab() {
       if (!res.ok || !data.success) {
         throw new Error(data.message || "Failed to start report");
       }
-      setImpactJob({ type: reportMode, fromDate, toDate });
-      setImpactStatus(data.status || "PENDING");
+
+      setImpactJobs((prev) => {
+        const exists = prev.find(
+          (j) => j.fromDate === fromDate && j.toDate === toDate
+        );
+        if (exists) {
+          return prev.map((j) =>
+            j.fromDate === fromDate && j.toDate === toDate
+              ? { ...j, status: data.status, jobName: data.jobName || j.jobName }
+              : j
+          );
+        }
+        return [
+          {
+            jobName: data.jobName,
+            fromDate,
+            toDate,
+            status: data.status || "PENDING",
+            createdAt: new Date().toISOString(),
+          },
+          ...prev,
+        ];
+      });
     } catch (err) {
       setImpactError(err.message);
     } finally {
@@ -194,10 +261,10 @@ function CorporateActionTab() {
     }
   };
 
-  const fetchImpactDownload = async (job) => {
+  const handleImpactDownload = async (job) => {
     try {
       const params = new URLSearchParams({
-        type: job.type,
+        type: reportMode,
         fromDate: job.fromDate,
         toDate: job.toDate,
       });
@@ -207,20 +274,17 @@ function CorporateActionTab() {
       );
       const data = await res.json();
       const url = data.downloadUrl?.signature || data.downloadUrl || "";
-      if (url) setImpactDownloadUrl(url);
-      else setImpactError("Report finished but the download link was missing.");
+      if (url) {
+        window.open(url, "_blank");
+      } else {
+        alert("Report finished but the download link was missing.");
+      }
     } catch (err) {
-      setImpactError("Failed to fetch the report download link.");
+      alert("Failed to fetch the report download link.");
     }
   };
 
-  const impactBusy = generating || isPollingStatus(impactStatus);
-  const statusClass =
-    impactStatus === "COMPLETED"
-      ? "completed"
-      : impactStatus === "FAILED" || impactStatus === "ERROR"
-      ? "failed"
-      : "pending";
+  const anyImpactBusy = generating || sortedImpactJobs.some((j) => isPollingStatus(j.status));
 
   return (
     <>
@@ -285,21 +349,27 @@ function CorporateActionTab() {
                   <tr>
                     <th>From Date</th>
                     <th>To Date</th>
-                    <th>Exported At</th>
+                    <th>Timestamp</th>
+                    <th>Status</th>
                     <th>Action</th>
                   </tr>
                 </thead>
                 <tbody>
                   {exportHistory.map((row, idx) => (
                     <tr
-                      key={`${row.fromDate}-${row.toDate}-${row.requestedAt}-${idx}`}
+                      key={`${row.jobName || `${row.fromDate}-${row.toDate}`}-${idx}`}
                     >
                       <td>{row.fromDate}</td>
                       <td>{row.toDate}</td>
                       <td>
-                        {row.requestedAt
-                          ? new Date(row.requestedAt).toLocaleString()
+                        {row.createdAt
+                          ? formatExportTimestamp(row.createdAt)
                           : "-"}
+                      </td>
+                      <td>
+                        <span className={`export-status ${statusBadgeClass(row.status)}`}>
+                          {row.status || "COMPLETED"}
+                        </span>
                       </td>
                       <td>
                         <button
@@ -336,30 +406,11 @@ function CorporateActionTab() {
                 <button
                   className="export-btn"
                   onClick={handleGenerateImpact}
-                  disabled={impactBusy}
+                  disabled={anyImpactBusy}
                 >
-                  {generating
-                    ? "Starting..."
-                    : isPollingStatus(impactStatus)
-                    ? "Generating..."
-                    : "Generate Report"}
+                  {generating ? "Starting..." : "Generate Report"}
                 </button>
               </div>
-
-              {impactStatus === "NO_DATA" && (
-                <div className="export-empty" style={{ marginTop: 8 }}>
-                  No corporate action found for the selected period.
-                </div>
-              )}
-
-              {impactStatus && impactStatus !== "NO_DATA" && (
-                <div
-                  className={`export-status ${statusClass}`}
-                  style={{ marginTop: 8 }}
-                >
-                  Status: {impactStatus}
-                </div>
-              )}
 
               {impactError && (
                 <div
@@ -370,16 +421,50 @@ function CorporateActionTab() {
                 </div>
               )}
 
-              {impactDownloadUrl && (
-                <div className="action-footer" style={{ marginTop: 8 }}>
-                  <a
-                    className="export-btn"
-                    href={impactDownloadUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    Download CSV
-                  </a>
+              {impactJobs.length > 0 && (
+                <div className="export-jobs-container">
+                  <h4>Previous Report History</h4>
+                  <table className="export-table">
+                    <thead>
+                      <tr>
+                        <th>From Date</th>
+                        <th>To Date</th>
+                        <th>Timestamp</th>
+                        <th>Status</th>
+                        <th>Action</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sortedImpactJobs.map((job, idx) => (
+                        <tr key={job.jobName || `${job.fromDate}-${job.toDate}-${idx}`}>
+                          <td>{job.fromDate}</td>
+                          <td>{job.toDate}</td>
+                          <td>
+                            {job.createdAt ? formatExportTimestamp(job.createdAt) : "—"}
+                          </td>
+                          <td>
+                            <span className={`export-status ${statusBadgeClass(job.status)}`}>
+                              {job.status}
+                            </span>
+                          </td>
+                          <td>
+                            {job.status === "COMPLETED" ? (
+                              <button
+                                className="export-btn"
+                                onClick={() => handleImpactDownload(job)}
+                              >
+                                Download
+                              </button>
+                            ) : job.status === "NO_DATA" ? (
+                              <span style={{ color: "#9ca3af" }}>No data</span>
+                            ) : (
+                              <span style={{ color: "#9ca3af" }}>-</span>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 </div>
               )}
             </>
