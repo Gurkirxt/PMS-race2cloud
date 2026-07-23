@@ -20,9 +20,13 @@
  * (allocation rounded to 0 shares) is still real — it is emitted with the NEW_*
  * columns zeroed, never dropped.
  *
- * Per-lot rows keep the ORIGINAL lot's TRANDATE (see DemergerFn), so the event
- * join key is Record_Date (stamped on every per-lot row), and the two sides of
- * one lot are paired by (WS_Account_code, Source_Tran_ROWID, TRANDATE).
+ * Per-lot rows keep the ORIGINAL lot's TRANDATE (see DemergerFn), so they
+ * cannot be matched to the event header by date alone — the (Old_ISIN,
+ * New_ISIN) pair is the join key. Record_Date is stamped on per-lot rows
+ * written by newer apply code and is used only to disambiguate two demergers
+ * of the same ISIN pair; legacy rows written before that stamping existed
+ * (empty Record_Date) still match. The two sides of one lot are paired by
+ * (WS_Account_code, Source_Tran_ROWID, TRANDATE).
  */
 
 const { buildVirtualToActualMap } = require("../virtualToActual.js");
@@ -91,19 +95,21 @@ async function buildEventCsv({ zcql, event, generatedAt, fromDate, toDate, csvCe
   /* ---- Read both sides' per-lot rows in one paginated scan ----
      Old-side and new-side rows of the same lot share WS_Account_code,
      Source_Tran_ROWID and TRANDATE; ROWID order keeps same-key lots
-     deterministic. */
+     deterministic. Joined by (Old_ISIN, New_ISIN) only — Record_Date is not
+     part of the WHERE clause because legacy rows predate Record_Date
+     stamping; rows that DO carry a Record_Date are filtered in JS below so
+     two demergers of the same ISIN pair don't bleed into each other. */
   const oldRows = []; // { acc, key, qty, wap, holdingValue }
   const newRows = [];
   let offset = 0;
   const oldEsc = esc(oldIsin);
   const newEsc = esc(newIsin);
-  const dateEsc = esc(recordDate);
 
   while (true) {
     const rows = await zcql.executeZCQLQuery(`
-      SELECT WS_Account_code, ISIN, QTY, WAP, HOLDING_VALUE, TRANDATE, Source_Tran_ROWID
+      SELECT WS_Account_code, ISIN, QTY, WAP, HOLDING_VALUE, TRANDATE, Source_Tran_ROWID, Record_Date
       FROM Demerger_Record
-      WHERE Record_Date = '${dateEsc}' AND Tran_Type = 'DEMERGER'
+      WHERE Tran_Type = 'DEMERGER'
         AND (ISIN = '${oldEsc}' OR ISIN = '${newEsc}')
       ORDER BY ROWID ASC
       LIMIT ${RECORD_BATCH} OFFSET ${offset}
@@ -115,6 +121,9 @@ async function buildEventCsv({ zcql, event, generatedAt, fromDate, toDate, csvCe
       const d = r.Demerger_Record || r;
       const acc = String(d.WS_Account_code || "").trim();
       if (!acc) continue;
+
+      const rowRecordDate = String(d.Record_Date ?? "").slice(0, 10);
+      if (rowRecordDate && rowRecordDate !== recordDate) continue;
 
       const side = {
         acc,
