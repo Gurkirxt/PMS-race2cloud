@@ -8,7 +8,7 @@ const INDIVIDUAL_TYPES = [
   { key: "split", label: "Split", supported: true },
   { key: "bonus", label: "Bonus", supported: true },
   { key: "dividend", label: "Dividend", supported: true },
-  { key: "merger", label: "Merger", supported: false },
+  { key: "merger", label: "Merger", supported: true },
   { key: "demerger", label: "Demerger", supported: false },
 ];
 
