@@ -15,13 +15,14 @@ const split = require("./split.js");
 const bonus = require("./bonus.js");
 const dividend = require("./dividend.js");
 const merger = require("./merger.js");
+const demerger = require("./demerger.js");
 
 const HANDLERS = {
   [split.reportType]: split,
   [bonus.reportType]: bonus,
   [dividend.reportType]: dividend,
   [merger.reportType]: merger,
-  // demerger: require("./demerger.js"),
+  [demerger.reportType]: demerger,
 };
 
 function getHandler(reportType) {

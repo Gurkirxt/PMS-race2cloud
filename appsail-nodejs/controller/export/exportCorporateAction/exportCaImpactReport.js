@@ -14,7 +14,7 @@ const STALE_TIMEOUT_MS = 60 * 60 * 1000;
 
 // Report types that have a handler registered in the Catalyst function's
 // handlers/ registry. Keep in sync as new handlers are added.
-const SUPPORTED_TYPES = new Set(["split", "bonus", "dividend", "merger"]);
+const SUPPORTED_TYPES = new Set(["split", "bonus", "dividend", "merger", "demerger"]);
 
 const parseCatalystTime = (ct) => {
   if (!ct) return 0;

@@ -9,7 +9,7 @@ const INDIVIDUAL_TYPES = [
   { key: "bonus", label: "Bonus", supported: true },
   { key: "dividend", label: "Dividend", supported: true },
   { key: "merger", label: "Merger", supported: true },
-  { key: "demerger", label: "Demerger", supported: false },
+  { key: "demerger", label: "Demerger", supported: true },
 ];
 
 const TERMINAL_STATUSES = ["COMPLETED", "FAILED", "ERROR", "NO_DATA"];
