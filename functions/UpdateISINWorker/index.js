@@ -76,6 +76,33 @@ const ISIN_TARGETS = [
   { table: "Demerger", cols: ["Old_ISIN", "New_ISIN"] },
 ];
 
+/**
+ * phase = "apply-new": tables where a security's Security_Code / Security_Name is
+ * updated for a given ISIN. Column casing is inconsistent per table (verified from
+ * the ZCQL strings that read/write each table), so it is spelled out explicitly.
+ *   - isinCol : the column that identifies the ISIN in that table.
+ *   - codeCol : security-code column, or null if the table has none.
+ *   - nameCol : security-name column, or null if the table has none.
+ * Demerger is two-sided (old + new ISIN), so it appears twice — the matching side's
+ * columns are updated. Temp_Transaction / Temp_Custodian are intentionally excluded.
+ * A table/column that doesn't actually exist is skipped harmlessly (the drain treats
+ * a failing SELECT as "nothing to do here").
+ */
+const APPLY_TARGETS = [
+  { table: "Security_List", isinCol: "ISIN", codeCol: "Security_Code", nameCol: "Security_Name" },
+  { table: "Transaction", isinCol: "ISIN", codeCol: "Security_code", nameCol: "Security_Name" },
+  { table: "Cash_Balance_Per_Transaction", isinCol: "ISIN", codeCol: null, nameCol: "Security_Name" },
+  { table: "Bonus", isinCol: "ISIN", codeCol: "SecurityCode", nameCol: "SecurityName" },
+  { table: "Bonus_Record", isinCol: "ISIN", codeCol: "SecurityCode", nameCol: "SecurityName" },
+  { table: "Split", isinCol: "ISIN", codeCol: "Security_Code", nameCol: "Security_Name" },
+  { table: "Dividend", isinCol: "ISIN", codeCol: "SecurityCode", nameCol: "Security_Name" },
+  { table: "Dividend_Record", isinCol: "ISIN", codeCol: "Security_Code", nameCol: null },
+  { table: "Merger_Record", isinCol: "ISIN", codeCol: "Security_Code", nameCol: "Security_Name" },
+  { table: "Demerger", isinCol: "New_ISIN", codeCol: "New_Security_Code", nameCol: "New_Security_Name" },
+  { table: "Demerger", isinCol: "Old_ISIN", codeCol: "Old_Security_Code", nameCol: "Old_Security_Name" },
+  { table: "Demerger_Record", isinCol: "ISIN", codeCol: "Security_Code", nameCol: "Security_Name" },
+];
+
 /* ============================== HELPERS ============================== */
 
 const esc = (v) => String(v ?? "").replace(/'/g, "''");
@@ -95,6 +122,25 @@ function getAllParams(jobRequest) {
 async function fetchOldRowIds(zcql, table, col, oldSql) {
   const rows = await zcql.executeZCQLQuery(
     `SELECT ROWID FROM ${table} WHERE ${col} = '${oldSql}' LIMIT ${BATCH}`,
+  );
+  const out = [];
+  for (const r of rows || []) {
+    const v = (r[table] || r).ROWID;
+    if (v != null) out.push(v);
+  }
+  return out;
+}
+
+/**
+ * Read up to BATCH ROWIDs for a table where `isinCol` matches the ISIN and `col`
+ * is still stale (NULL, or different from the target value). Used by apply-new;
+ * self-draining, since an UPDATE takes rows out of this set.
+ */
+async function fetchStaleRowIds(zcql, table, isinCol, col, isinSql, valSql) {
+  const rows = await zcql.executeZCQLQuery(
+    `SELECT ROWID FROM ${table}
+     WHERE ${isinCol} = '${isinSql}'
+       AND (${col} IS NULL OR ${col} != '${valSql}') LIMIT ${BATCH}`,
   );
   const out = [];
   for (const r of rows || []) {
@@ -129,6 +175,26 @@ async function submitContinuation(app, params, targetIndex, startedAt) {
       new_isin: params.new_isin,
       status_key: params.status_key,
       target_index: String(targetIndex),
+    },
+  });
+}
+
+/** Re-queue this worker to resume the apply-new drain at `applyIndex` (baton pass). */
+async function submitApplyContinuation(app, params, applyIndex, startedAt) {
+  const jobName = `IA_${applyIndex}_${startedAt}`.slice(0, 20);
+  await app.jobScheduling().JOB.submitJob({
+    job_name: jobName,
+    jobpool_name: WORKER_JOBPOOL,
+    target_name: WORKER_TARGET,
+    target_type: "Function",
+    job_config: { number_of_retries: 5, retry_interval: 60 * 1000 },
+    params: {
+      phase: "apply-new",
+      isin: params.isin,
+      security_code: params.security_code,
+      security_name: params.security_name,
+      status_key: params.status_key,
+      apply_index: String(applyIndex),
     },
   });
 }
@@ -213,6 +279,97 @@ async function runRebuildPhase(app, zcql, newIsin, statusKey) {
   await finalizeJobsRow(zcql, statusKey, "SUCCESS");
 }
 
+/**
+ * phase = "apply-new": update Security_Code / Security_Name for a single ISIN across
+ * every APPLY_TARGETS table, in timeout-proof batches. Self-draining (updated rows
+ * leave the `col != val` set) with a baton pass on `apply_index` when the budget is
+ * hit. No Holdings rebuild — Holdings carries no security code/name column.
+ */
+async function runApplyPhase(app, zcql, p, startedAt, context) {
+  const isin = String(p.isin ?? "").trim();
+  const code = String(p.security_code ?? "").trim();
+  const name = String(p.security_name ?? "").trim();
+  const statusKey = String(p.status_key ?? "").trim();
+  const startIndex = Math.max(0, Number(p.apply_index ?? 0) || 0);
+
+  if (!isin) {
+    console.error("[UpdateISINWorker/apply-new] isin is required.");
+    context.closeWithFailure();
+    return;
+  }
+  if (!code && !name) {
+    console.error("[UpdateISINWorker/apply-new] security_code or security_name is required.");
+    context.closeWithFailure();
+    return;
+  }
+
+  const isinSql = esc(isin);
+
+  // Deterministic flat job list (identical across invocations, so apply_index resumes).
+  const jobs = [];
+  for (const t of APPLY_TARGETS) {
+    if (code && t.codeCol) jobs.push({ table: t.table, isinCol: t.isinCol, col: t.codeCol, val: code });
+    if (name && t.nameCol) jobs.push({ table: t.table, isinCol: t.isinCol, col: t.nameCol, val: name });
+  }
+
+  console.log(
+    `[UpdateISINWorker/apply-new] isin="${isin}" code="${code}" name="${name}" | ` +
+      `${jobs.length} column-job(s), resume at ${startIndex}`,
+  );
+
+  let totalUpdated = 0;
+
+  for (let i = startIndex; i < jobs.length; i++) {
+    const { table, isinCol, col, val } = jobs[i];
+    const valSql = esc(val);
+
+    // Drain this column batch-by-batch until no stale rows remain.
+    while (true) {
+      // Hand off before the timeout; resume this same column-job next time.
+      if (Date.now() - startedAt > TIME_BUDGET_MS) {
+        console.log(
+          `[UpdateISINWorker/apply-new] time budget hit at ${table}.${col} ` +
+            `(updated ${totalUpdated} so far) — passing baton at apply_index ${i}.`,
+        );
+        await submitApplyContinuation(app, p, i, startedAt);
+        context.closeWithSuccess();
+        return;
+      }
+
+      let ids;
+      try {
+        ids = await fetchStaleRowIds(zcql, table, isinCol, col, isinSql, valSql);
+      } catch (e) {
+        // Column/table not present or query error — log and skip this column.
+        console.warn(`[UpdateISINWorker/apply-new] select ${table}.${col} skipped:`, e.message);
+        break;
+      }
+
+      if (ids.length === 0) break; // this column is fully synced
+
+      try {
+        await zcql.executeZCQLQuery(
+          `UPDATE ${table} SET ${col} = '${valSql}' WHERE ROWID IN (${ids.join(",")})`,
+        );
+        totalUpdated += ids.length;
+      } catch (e) {
+        // Break (not continue) so a failing UPDATE can't spin forever.
+        console.warn(`[UpdateISINWorker/apply-new] update ${table}.${col} failed:`, e.message);
+        break;
+      }
+    }
+
+    console.log(`[UpdateISINWorker/apply-new] synced ${table}.${col}`);
+  }
+
+  console.log(
+    `[UpdateISINWorker/apply-new] DONE isin="${isin}" | ${totalUpdated} row(s) ` +
+      `in ${Date.now() - startedAt}ms.`,
+  );
+  await finalizeJobsRow(zcql, statusKey, "SUCCESS");
+  context.closeWithSuccess();
+}
+
 /* ============================== ENTRY ============================== */
 
 module.exports = async (jobRequest, context) => {
@@ -237,6 +394,12 @@ module.exports = async (jobRequest, context) => {
       }
       await runRebuildPhase(app, zcql, newIsin, statusKey);
       context.closeWithSuccess();
+      return;
+    }
+
+    // apply-new: update Security_Code / Security_Name for one ISIN (baton-passed).
+    if (phase === "apply-new") {
+      await runApplyPhase(app, zcql, p, startedAt, context);
       return;
     }
 

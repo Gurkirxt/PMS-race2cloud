@@ -210,6 +210,7 @@ export const postApplyNewISIN = async (req, res) => {
         isin: isinTrim,
         security_code: codeTrim,
         security_name: nameTrim,
+        status_key: catalystJobName,
       },
     });
 

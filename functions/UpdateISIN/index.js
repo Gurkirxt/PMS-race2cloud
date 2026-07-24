@@ -10,26 +10,21 @@
  *     merger/demerger old + new ISIN columns). See UpdateISINWorker/index.js.
  *
  *   mode = "apply-new" (params: isin, security_code?, security_name?)
- *     Backs the "New ISIN" Apply panel. Syncs Security_Code / Security_Name
- *     for the given ISIN across NEW_ISIN_TARGETS. Per column, per row:
- *       - Skip if existing value already equals the new value.
- *       - Otherwise (NULL, empty, or different) → UPDATE.
+ *     Backs the "New ISIN" Apply panel. Does NO updating itself — it opens a Jobs
+ *     status row and dispatches one UpdateISINWorker job (phase = "apply-new"),
+ *     which syncs Security_Code / Security_Name for the given ISIN across every
+ *     relevant table in small, timeout-proof batches (baton-passed). Per column,
+ *     per row: skip if already equal, otherwise (NULL, empty, or different) UPDATE.
  *     If a value param is blank/missing, that column is not touched at all.
- *     Column casing differs by table — handled per entry in NEW_ISIN_TARGETS.
  */
 
 const catalyst = require("zcatalyst-sdk-node");
 
 const esc = (v) => String(v ?? "").replace(/'/g, "''");
 
-/** Worker that performs the batched rename, and the pool it runs in. */
+/** Worker that performs the batched rename / apply, and the pool it runs in. */
 const WORKER_TARGET = "UpdateISINWorker";
 const WORKER_JOBPOOL = "UpdateMasters";
-
-const NEW_ISIN_TARGETS = [
-  { table: "Security_List", codeCol: "Security_Code", nameCol: "Security_Name" },
-  { table: "Transaction", codeCol: "Security_code", nameCol: "Security_Name" },
-];
 
 /** Open (or reset) the Jobs row the worker marks SUCCESS when the rename finishes. */
 async function ensureJobsRowRunning(zcql, jobName) {
@@ -83,47 +78,14 @@ async function runRenameMode(app, zcql, params) {
   console.log(`[UpdateISIN/rename] Worker queued (${workerJobName}) for "${oldIsin}" → "${newIsin}"`);
 }
 
-async function countRowsToSync(zcql, table, col, isin, newVal) {
-  try {
-    const rows = await zcql.executeZCQLQuery(
-      `SELECT COUNT(ROWID) FROM ${table}
-       WHERE ISIN = '${esc(isin)}'
-         AND (${col} IS NULL OR ${col} != '${esc(newVal)}')`
-    );
-    const r = rows?.[0]?.[table] || rows?.[0] || {};
-    return Number(
-      r["COUNT(ROWID)"] ?? r.cnt ?? r["count"] ?? Object.values(r)[0] ?? 0
-    );
-  } catch (err) {
-    console.warn(`[UpdateISIN/apply-new] count ${table}.${col} failed:`, err?.message);
-    return -1;
-  }
-}
-
-async function syncColumn(zcql, table, col, isin, newVal) {
-  const before = await countRowsToSync(zcql, table, col, isin, newVal);
-  try {
-    await zcql.executeZCQLQuery(
-      `UPDATE ${table}
-       SET ${col} = '${esc(newVal)}'
-       WHERE ISIN = '${esc(isin)}'
-         AND (${col} IS NULL OR ${col} != '${esc(newVal)}')`
-    );
-    console.log(`[UpdateISIN/apply-new] ${table}.${col}: updated ~${before} row(s)`);
-    return before >= 0 ? before : 0;
-  } catch (err) {
-    console.warn(`[UpdateISIN/apply-new] ${table}.${col} update skipped:`, err?.message);
-    return 0;
-  }
-}
-
-async function runApplyNewMode(zcql, params) {
+async function runApplyNewMode(app, zcql, params) {
   const isin = String(params.isin ?? "").trim();
   const securityCode = String(params.security_code ?? "").trim();
   const securityName = String(params.security_name ?? "").trim();
+  const statusKey = String(params.status_key ?? "").trim();
 
   console.log(
-    `[UpdateISIN/apply-new] Started: isin="${isin}" code="${securityCode}" name="${securityName}"`
+    `[UpdateISIN/apply-new] Dispatching worker: isin="${isin}" code="${securityCode}" name="${securityName}"`
   );
 
   if (!isin) {
@@ -135,25 +97,26 @@ async function runApplyNewMode(zcql, params) {
     );
   }
 
-  const summary = [];
+  await ensureJobsRowRunning(zcql, statusKey);
 
-  for (const { table, codeCol, nameCol } of NEW_ISIN_TARGETS) {
-    let codeUpdates = 0;
-    let nameUpdates = 0;
+  const workerJobName = `IA0_${Date.now()}`.slice(0, 20);
+  await app.jobScheduling().JOB.submitJob({
+    job_name: workerJobName,
+    jobpool_name: WORKER_JOBPOOL,
+    target_name: WORKER_TARGET,
+    target_type: "Function",
+    job_config: { number_of_retries: 5, retry_interval: 60 * 1000 },
+    params: {
+      phase: "apply-new",
+      isin,
+      security_code: securityCode,
+      security_name: securityName,
+      status_key: statusKey,
+      apply_index: "0",
+    },
+  });
 
-    if (securityCode) {
-      codeUpdates = await syncColumn(zcql, table, codeCol, isin, securityCode);
-    }
-    if (securityName) {
-      nameUpdates = await syncColumn(zcql, table, nameCol, isin, securityName);
-    }
-
-    summary.push({ table, codeUpdates, nameUpdates });
-  }
-
-  console.log(
-    `[UpdateISIN/apply-new] Done isin="${isin}" — ${JSON.stringify(summary)}`
-  );
+  console.log(`[UpdateISIN/apply-new] Worker queued (${workerJobName}) for isin="${isin}"`);
 }
 
 /**
@@ -171,7 +134,7 @@ module.exports = async (jobRequest, context) => {
     if (mode === "rename") {
       await runRenameMode(catalystApp, zcql, params);
     } else if (mode === "apply-new") {
-      await runApplyNewMode(zcql, params);
+      await runApplyNewMode(catalystApp, zcql, params);
     } else {
       throw new Error(`Unknown mode: "${mode}" (expected "rename" or "apply-new")`);
     }
