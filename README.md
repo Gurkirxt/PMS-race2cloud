@@ -549,7 +549,7 @@ Summary cards, charts, and filter bar are **static/hardcoded** — no API.
 | Page | Key endpoints |
 |------|---------------|
 | **Split** | `GET /split/getAllSecuritiesList`, `POST /split/preview`, `POST /split/add` (sync), `GET /split/export-preview` |
-| **Bonus** | `GET /bonus/getAllSecuritiesList`, `POST /bonus/preview`, `POST /bonus/apply`, `GET /bonus/apply-status` (poll 10s), `GET /bonus/export-preview`, `GET /export/bonus-preview` |
+| **Bonus** | `GET /bonus/getAllSecuritiesList`, `POST /bonus/preview`, `POST /bonus/apply`, `GET /bonus/apply-status` (poll 10s), `GET /bonus/export-preview`, `GET /export/bonus-preview`. Preview UI groups by Actual Code with expandable Virtual Code rows; export CSV still flat virtual+actual. |
 | **Dividend** | `GET /dividend/getAllSecuritiesList`, `POST /dividend/preview` (multipart + custodian CSV), `POST /dividend/apply`, `GET /dividend/apply-status` (poll 10s) |
 | **Demerger** | `GET /split/getAllSecuritiesList`, `POST /demerger/preview`, `POST /demerger/apply`, `GET /demerger/apply-status` (poll 3s) |
 | **Merger** | `GET /isin/security-list-isins` (fallback: `/split/getAllSecuritiesList`), `POST /merger/preview`, `POST /merger/apply`, `GET /merger/apply-status` (poll 3s) |
@@ -597,7 +597,7 @@ Summary cards, charts, and filter bar are **static/hardcoded** — no API.
 
 | Page | Endpoint |
 |------|----------|
-| Client | `GET /client/list` |
+| Client | `GET /client/list` — UI filters client-side by virtual (`WS_Account_code`) or actual (`Actual_Code`) in one search box |
 | Security | `GET /security/list` |
 
 ### Job Polling Patterns
@@ -647,7 +647,7 @@ Four tabs: Holding, Allocation, Performance, Transaction.
 
 **ISIN search:** Split / Bonus / Demerger filter with null-safe `String(field ?? "").toLowerCase()` so rows with null `ISIN` / `Security_Code` / `Security_Name` (e.g. CASH stubs in `Security_List`) do not throw `Cannot read properties of null (reading 'toLowerCase')`. Dropdown keys use `` `${isin || "no-isin"}-${idx}` ``. Dividend and Merger already used optional chaining / `String(...?? "")`.
 
-**Split / Bonus preview columns:** Virtual Code (`accountCode` = `WS_Account_code` from Holdings) and Actual Code (`actualCode` from `clientIds` via `util/mapVirtualToActualCodes.js`, per-code lookup preferring non-empty `Actual_Code` when duplicate rows exist). Same columns appear in Split/Bonus **export-preview** CSVs (`VIRTUAL_CODE`, `ACTUAL_CODE`). Demerger/Merger/Dividend previews unchanged.
+**Split / Bonus preview columns:** Split still shows Virtual Code + Actual Code side by side. **Bonus UI** groups the preview by Actual Code (parent row with summed holdings metrics); clicking an Actual Code expands its Virtual Codes with per-scheme Current Holding / Bonus Shares / New Holding / Δ. Split/Bonus **export-preview** CSVs are unchanged (`VIRTUAL_CODE`, `ACTUAL_CODE`, holdings…). Demerger/Merger/Dividend previews unchanged.
 
 **Dividend-specific:** Requires custodian Benefit Collection Report CSV on preview. Shows reconciliation status chips (matched/mismatch/partial). Client-side CSV export of reconciliation grid. `applyMode` and optional `accountCodes` sent on apply.
 
@@ -683,7 +683,7 @@ ISIN dropdowns populated from `/isin/security-list-isins` with autocomplete. Use
 
 #### Master Pages
 
-- **Client** — table from `/client/list`.
+- **Client** — table from `/client/list`. Single search field (“Filter by Virtual Code”) matches `WS_Account_code` **or** `Actual_Code`; entering an actual code lists every related virtual-code row. Autocomplete suggestions remain distinct virtual codes from the current matches.
 - **Security** — table from `/security/list`.
 
 ### End-to-End User Flows

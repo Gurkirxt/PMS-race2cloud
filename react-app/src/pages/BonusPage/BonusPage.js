@@ -1,8 +1,9 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import MainLayout from "../../layouts/MainLayout";
 import { Card } from "../../components/common/CommonComponents";
 import "./BonusPage.css";
 import { BASE_URL } from "../../constant";
+
 function BonusPage() {
   /* ===========================
      FORM STATE
@@ -28,23 +29,64 @@ function BonusPage() {
 
   const [previewData, setPreviewData] = useState([]);
   const [step, setStep] = useState("form");
+  /** Actual codes whose virtual-scheme rows are expanded in the preview table. */
+  const [expandedActuals, setExpandedActuals] = useState(() => new Set());
 
   const [exportDownloadUrl, setExportDownloadUrl] = useState("");
   const [exportLoading, setExportLoading] = useState(false);
 
   /* ===========================
-     PAGINATION
+     GROUP BY ACTUAL CODE + PAGINATION
      =========================== */
   const PAGE_SIZE = 10;
   const [page, setPage] = useState(1);
 
-  useEffect(() => setPage(1), [previewData]);
+  const previewGroups = useMemo(() => {
+    const map = new Map();
+    for (const row of previewData) {
+      const actualKey = String(row.actualCode ?? "").trim() || "—";
+      let group = map.get(actualKey);
+      if (!group) {
+        group = {
+          actualCode: actualKey,
+          isin: row.isin || "",
+          virtuals: [],
+          currentHolding: 0,
+          bonusShares: 0,
+          newHolding: 0,
+          delta: 0,
+        };
+        map.set(actualKey, group);
+      }
+      group.virtuals.push(row);
+      group.currentHolding += Number(row.currentHolding) || 0;
+      group.bonusShares += Number(row.bonusShares) || 0;
+      group.newHolding += Number(row.newHolding) || 0;
+      group.delta += Number(row.delta) || 0;
+      if (!group.isin && row.isin) group.isin = row.isin;
+    }
+    return [...map.values()];
+  }, [previewData]);
 
-  const totalPages = Math.ceil(previewData.length / PAGE_SIZE);
-  const paginatedPreview = previewData.slice(
+  useEffect(() => {
+    setPage(1);
+    setExpandedActuals(new Set());
+  }, [previewData]);
+
+  const totalPages = Math.ceil(previewGroups.length / PAGE_SIZE) || 1;
+  const paginatedGroups = previewGroups.slice(
     (page - 1) * PAGE_SIZE,
     page * PAGE_SIZE,
   );
+
+  const toggleActualExpand = (actualCode) => {
+    setExpandedActuals((prev) => {
+      const next = new Set(prev);
+      if (next.has(actualCode)) next.delete(actualCode);
+      else next.add(actualCode);
+      return next;
+    });
+  };
 
   const dropdownRef = useRef(null);
 
@@ -324,7 +366,6 @@ function BonusPage() {
                 <table className="bonus-preview-table">
                   <thead>
                     <tr>
-                      <th>Virtual Code</th>
                       <th>Actual Code</th>
                       <th>ISIN</th>
                       <th>Current Holding</th>
@@ -335,19 +376,80 @@ function BonusPage() {
                   </thead>
 
                   <tbody>
-                    {paginatedPreview.map((row) => (
-                      <tr key={row.accountCode}>
-                        <td>{row.accountCode}</td>
-                        <td>{row.actualCode || "—"}</td>
-                        <td>{row.isin}</td>
-                        <td>{Math.floor(Number(row.currentHolding) || 0)}</td>
-                        <td>{row.bonusShares}</td>
-                        <td>{Math.floor(Number(row.newHolding) || 0)}</td>
-                        <td style={{ color: "#166534", fontWeight: 600 }}>
-                          +{row.delta}
-                        </td>
-                      </tr>
-                    ))}
+                    {paginatedGroups.map((group) => {
+                      const expanded = expandedActuals.has(group.actualCode);
+                      return (
+                        <React.Fragment key={group.actualCode}>
+                          <tr
+                            className="bonus-preview-parent-row"
+                            onClick={() =>
+                              toggleActualExpand(group.actualCode)
+                            }
+                          >
+                            <td>
+                              <button
+                                type="button"
+                                className="bonus-actual-toggle"
+                                aria-expanded={expanded}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  toggleActualExpand(group.actualCode);
+                                }}
+                              >
+                                <span
+                                  className="bonus-actual-chevron"
+                                  aria-hidden
+                                >
+                                  {expanded ? "▾" : "▸"}
+                                </span>
+                                {group.actualCode}
+                                <span className="bonus-virtual-count">
+                                  {group.virtuals.length} virtual
+                                  {group.virtuals.length === 1 ? "" : "s"}
+                                </span>
+                              </button>
+                            </td>
+                            <td>{group.isin}</td>
+                            <td>
+                              {Math.floor(Number(group.currentHolding) || 0)}
+                            </td>
+                            <td>{Math.floor(Number(group.bonusShares) || 0)}</td>
+                            <td>
+                              {Math.floor(Number(group.newHolding) || 0)}
+                            </td>
+                            <td className="bonus-delta-cell">
+                              +{Math.floor(Number(group.delta) || 0)}
+                            </td>
+                          </tr>
+
+                          {expanded &&
+                            group.virtuals.map((row) => (
+                              <tr
+                                key={`${group.actualCode}-${row.accountCode}`}
+                                className="bonus-preview-child-row"
+                              >
+                                <td className="bonus-virtual-cell">
+                                  <span className="bonus-virtual-label">
+                                    Virtual
+                                  </span>
+                                  {row.accountCode}
+                                </td>
+                                <td>{row.isin}</td>
+                                <td>
+                                  {Math.floor(Number(row.currentHolding) || 0)}
+                                </td>
+                                <td>{row.bonusShares}</td>
+                                <td>
+                                  {Math.floor(Number(row.newHolding) || 0)}
+                                </td>
+                                <td className="bonus-delta-cell">
+                                  +{row.delta}
+                                </td>
+                              </tr>
+                            ))}
+                        </React.Fragment>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>

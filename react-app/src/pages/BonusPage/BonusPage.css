@@ -485,8 +485,14 @@
   color: #ffffff;
 }
 
-.bonus-preview-table tbody tr:hover td:nth-child(7) {
+.bonus-preview-table tbody tr:hover .bonus-delta-cell {
   color: #bbf7d0;
+}
+
+.bonus-preview-table tbody tr:hover .bonus-actual-toggle,
+.bonus-preview-table tbody tr:hover .bonus-virtual-count,
+.bonus-preview-table tbody tr:hover .bonus-virtual-label {
+  color: #ffffff;
 }
 
 /* Action area */
@@ -497,24 +503,28 @@
   gap: 16px;
   margin-top: 16px;
 }
+
+.bonus-preview-table th:nth-child(3),
+.bonus-preview-table th:nth-child(4),
 .bonus-preview-table th:nth-child(5),
 .bonus-preview-table th:nth-child(6),
-.bonus-preview-table th:nth-child(7),
+.bonus-preview-table td:nth-child(3),
+.bonus-preview-table td:nth-child(4),
 .bonus-preview-table td:nth-child(5),
-.bonus-preview-table td:nth-child(6),
-.bonus-preview-table td:nth-child(7) {
+.bonus-preview-table td:nth-child(6) {
   text-align: right;
 }
+
 .bonus-preview-table td:nth-child(1) {
   font-weight: 600;
   letter-spacing: 0.02em;
 }
+
 .bonus-preview-table td:nth-child(2) {
   line-height: 1.35;
-}
-.bonus-preview-table td:nth-child(3) {
   color: #374151;
 }
+
 .bonus-preview-table tbody tr:nth-child(even) {
   background: #f9fafb;
 }
@@ -522,16 +532,73 @@
 .bonus-preview-table tbody tr:nth-child(even):hover {
   background: #166534;
 }
-.bonus-preview-table td:nth-child(4) {
-  font-weight: 500;
-}
 
 /* Delta column emphasis */
-.bonus-preview-table td:nth-child(7) {
+.bonus-preview-table .bonus-delta-cell {
   font-weight: 700;
   color: #166534;
 }
-  
+
+.bonus-preview-parent-row {
+  cursor: pointer;
+}
+
+.bonus-actual-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+}
+
+.bonus-actual-chevron {
+  display: inline-block;
+  width: 1em;
+  color: #c2185b;
+  font-size: 12px;
+}
+
+.bonus-virtual-count {
+  font-size: 11px;
+  font-weight: 500;
+  color: #6b7280;
+  background: #f3f4f6;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+
+.bonus-preview-child-row {
+  background: #fdf2f8 !important;
+}
+
+.bonus-preview-child-row:hover {
+  background: #166534 !important;
+}
+
+.bonus-virtual-cell {
+  padding-left: 36px !important;
+  font-weight: 500 !important;
+}
+
+.bonus-virtual-label {
+  display: inline-block;
+  margin-right: 8px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #9d174d;
+  background: #fce7f3;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
 .bonus-submit:disabled {
   opacity: 0.6;
   cursor: not-allowed;
