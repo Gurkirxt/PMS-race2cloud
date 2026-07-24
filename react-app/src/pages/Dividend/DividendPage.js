@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import MainLayout from "../../layouts/MainLayout";
 import { Card } from "../../components/common/CommonComponents";
 import "./DividendPage.css";
@@ -96,21 +96,106 @@ function DividendPage() {
 
   useEffect(() => setPage(1), [reconEvents, statusFilter, activeEvent]);
 
-  /* Currently selected event's reconciled rows (filtered by status chip). */
+  /* Drill-down: which actual-account groups are currently expanded. */
+  const [expandedKeys, setExpandedKeys] = useState(() => new Set());
+  const toggleGroup = (key) =>
+    setExpandedKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+
+  /* Currently selected event's reconciled rows. */
   const activeEventObj =
     reconEvents && reconEvents.length > 0
       ? reconEvents[Math.min(activeEvent, reconEvents.length - 1)]
       : null;
-  const filteredReconRows = (() => {
-    if (!activeEventObj) return [];
-    if (statusFilter === "all") return activeEventObj.rows;
-    return activeEventObj.rows.filter((r) => r.status === statusFilter);
-  })();
+
+  /*
+   * Aggregate the active event's rows into one group per actual account.
+   * Grouping key = actualCode || accountCode, so virtual-code rows (whose
+   * actualCode resolves to the real account) and rows booked directly under an
+   * actual code (actualCode === "" → keyed by their own accountCode) fold into
+   * the same group. Numeric columns are summed across children; rate is
+   * per-share so it is shown once (or "—" if children disagree). Deltas are
+   * derived from the group totals. Grouping is display-only — the raw child
+   * rows are preserved for the drill-down, export and apply.
+   */
+  const roundTo2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+  const groupedReconRows = useMemo(() => {
+    const rows = activeEventObj?.rows || [];
+    const groups = new Map();
+    for (const row of rows) {
+      const key = String(row.actualCode || "").trim() || row.accountCode;
+      let g = groups.get(key);
+      if (!g) {
+        g = {
+          key,
+          actualCode: String(row.actualCode || "").trim(),
+          clientName: row.clientName || "",
+          holdingSys: 0,
+          holdingFile: 0,
+          grossSys: 0,
+          grossFile: 0,
+          tdsFile: 0,
+          netFile: 0,
+          alreadyReceivedGross: 0,
+          toReceiveNet: 0,
+          rateSys: row.rateSys,
+          rateFile: row.rateFile,
+          rateSysMixed: false,
+          rateFileMixed: false,
+          statusCounts: {},
+          children: [],
+        };
+        groups.set(key, g);
+      }
+      if (!g.actualCode && row.actualCode)
+        g.actualCode = String(row.actualCode).trim();
+      if (!g.clientName && row.clientName) g.clientName = row.clientName;
+      g.holdingSys += Number(row.holdingSys) || 0;
+      g.holdingFile += Number(row.holdingFile) || 0;
+      g.grossSys += Number(row.grossSys) || 0;
+      g.grossFile += Number(row.grossFile) || 0;
+      g.tdsFile += Number(row.tdsFile) || 0;
+      g.netFile += Number(row.netFile) || 0;
+      g.alreadyReceivedGross += Number(row.alreadyReceivedGross) || 0;
+      g.toReceiveNet += Number(row.toReceiveNet) || 0;
+      if (row.rateSys !== g.rateSys) g.rateSysMixed = true;
+      if (row.rateFile !== g.rateFile) g.rateFileMixed = true;
+      g.statusCounts[row.status] = (g.statusCounts[row.status] || 0) + 1;
+      g.children.push(row);
+    }
+    for (const g of groups.values()) {
+      g.holdingSys = roundTo2(g.holdingSys);
+      g.holdingFile = roundTo2(g.holdingFile);
+      g.grossSys = roundTo2(g.grossSys);
+      g.grossFile = roundTo2(g.grossFile);
+      g.tdsFile = roundTo2(g.tdsFile);
+      g.netFile = roundTo2(g.netFile);
+      g.alreadyReceivedGross = roundTo2(g.alreadyReceivedGross);
+      g.toReceiveNet = roundTo2(g.toReceiveNet);
+      g.holdingDelta = roundTo2(g.holdingFile - g.holdingSys);
+      g.grossDelta = roundTo2(g.grossFile - g.grossSys);
+    }
+    return [...groups.values()];
+  }, [activeEventObj]);
+
+  /*
+   * Status filter: keep a whole group (all children, full totals) whenever at
+   * least one of its children matches the active status chip.
+   */
+  const filteredGroups =
+    statusFilter === "all"
+      ? groupedReconRows
+      : groupedReconRows.filter((g) => (g.statusCounts[statusFilter] || 0) > 0);
+
   const reconTotalPages = Math.max(
     1,
-    Math.ceil(filteredReconRows.length / PAGE_SIZE),
+    Math.ceil(filteredGroups.length / PAGE_SIZE),
   );
-  const paginatedReconRows = filteredReconRows.slice(
+  const paginatedGroups = filteredGroups.slice(
     (page - 1) * PAGE_SIZE,
     page * PAGE_SIZE,
   );
@@ -842,7 +927,7 @@ function DividendPage() {
                 </tr>
               </thead>
               <tbody>
-                {paginatedReconRows.length === 0 && (
+                {paginatedGroups.length === 0 && (
                   <tr>
                     <td
                       colSpan={9}
@@ -852,76 +937,145 @@ function DividendPage() {
                     </td>
                   </tr>
                 )}
-                {paginatedReconRows.map((row) => (
-                  <tr
-                    key={`${row.accountCode}`}
-                    className={`recon-row recon-row-${row.status}`}
-                    title={row.clientName || ""}
-                  >
-                    <td>
-                      <div style={{ fontWeight: 600 }}>{row.accountCode}</div>
-                      {row.clientName && (
-                        <div className="recon-account-subtitle">{row.clientName}</div>
-                      )}
-                    </td>
-                    <td>
-                      {row.holdingSys ?? "—"} / {row.holdingFile ?? "—"} /{" "}
-                      <span
-                        className={
-                          row.holdingDelta === 0
-                            ? "delta-zero"
-                            : row.holdingDelta > 0
-                              ? "delta-pos"
-                              : "delta-neg"
-                        }
+                {paginatedGroups.map((group) => {
+                  const expanded = expandedKeys.has(group.key);
+                  const deltaClass = (d) =>
+                    d === 0 ? "delta-zero" : d > 0 ? "delta-pos" : "delta-neg";
+                  return (
+                    <React.Fragment key={group.key}>
+                      <tr
+                        className="recon-row dividend-group-row"
+                        role="button"
+                        onClick={() => toggleGroup(group.key)}
+                        title={group.clientName || ""}
                       >
-                        {row.holdingDelta > 0 ? "+" : ""}
-                        {row.holdingDelta || 0}
-                      </span>
-                    </td>
-                    <td>
-                      {row.rateSys ?? "—"} / {row.rateFile ?? "—"}
-                    </td>
-                    <td>
-                      {row.grossSys ?? "—"} / {row.grossFile ?? "—"} /{" "}
-                      <span
-                        className={
-                          row.grossDelta === 0
-                            ? "delta-zero"
-                            : row.grossDelta > 0
-                              ? "delta-pos"
-                              : "delta-neg"
-                        }
-                      >
-                        {row.grossDelta > 0 ? "+" : ""}
-                        {row.grossDelta || 0}
-                      </span>
-                    </td>
-                    <td>{row.tdsFile ?? "—"}</td>
-                    <td style={{ fontWeight: 600 }}>{row.netFile ?? "—"}</td>
-                    <td
-                      title={
-                        row.alreadyCreditedCash
-                          ? "DIVIDEND cash credit recorded for this record date"
-                          : undefined
-                      }
-                    >
-                      {row.alreadyReceivedGross || 0}
-                    </td>
-                    <td style={{ fontWeight: 600 }}>{row.toReceiveNet}</td>
-                    <td>
-                      <span className={`recon-badge recon-badge-${row.status}`}>
-                        {STATUS_LABEL[row.status] || row.status}
-                      </span>
-                    </td>
-                  </tr>
-                ))}
+                        <td>
+                          <div style={{ fontWeight: 600 }}>
+                            <span className="dividend-expand-toggle">
+                              {expanded ? "▾" : "▸"}
+                            </span>
+                            {group.actualCode || group.key} (
+                            {group.children.length})
+                          </div>
+                          {group.clientName && (
+                            <div className="recon-account-subtitle">
+                              {group.clientName}
+                            </div>
+                          )}
+                        </td>
+                        <td>
+                          {group.holdingSys} / {group.holdingFile} /{" "}
+                          <span className={deltaClass(group.holdingDelta)}>
+                            {group.holdingDelta > 0 ? "+" : ""}
+                            {group.holdingDelta || 0}
+                          </span>
+                        </td>
+                        <td>
+                          {group.rateSysMixed ? "—" : (group.rateSys ?? "—")} /{" "}
+                          {group.rateFileMixed ? "—" : (group.rateFile ?? "—")}
+                        </td>
+                        <td>
+                          {group.grossSys} / {group.grossFile} /{" "}
+                          <span className={deltaClass(group.grossDelta)}>
+                            {group.grossDelta > 0 ? "+" : ""}
+                            {group.grossDelta || 0}
+                          </span>
+                        </td>
+                        <td>{group.tdsFile}</td>
+                        <td style={{ fontWeight: 600 }}>{group.netFile}</td>
+                        <td>{group.alreadyReceivedGross || 0}</td>
+                        <td style={{ fontWeight: 600 }}>{group.toReceiveNet}</td>
+                        <td>
+                          <span className="recon-status-breakdown">
+                            {Object.entries(group.statusCounts).map(
+                              ([status, count]) => (
+                                <span
+                                  key={status}
+                                  className={`recon-badge recon-badge-${status}`}
+                                >
+                                  {count} {STATUS_LABEL[status] || status}
+                                </span>
+                              ),
+                            )}
+                          </span>
+                        </td>
+                      </tr>
+                      {expanded &&
+                        group.children.map((row) => (
+                          <tr
+                            key={`${group.key}::${row.accountCode}`}
+                            className={`recon-row dividend-detail-row recon-row-${row.status}`}
+                            title={row.clientName || ""}
+                          >
+                            <td className="dividend-detail-code">
+                              <div style={{ fontWeight: 600 }}>
+                                {row.accountCode}
+                              </div>
+                              {row.clientName && (
+                                <div className="recon-account-subtitle">
+                                  {row.clientName}
+                                </div>
+                              )}
+                            </td>
+                            <td>
+                              {row.holdingSys ?? "—"} / {row.holdingFile ?? "—"}{" "}
+                              /{" "}
+                              <span className={deltaClass(row.holdingDelta)}>
+                                {row.holdingDelta > 0 ? "+" : ""}
+                                {row.holdingDelta || 0}
+                              </span>
+                            </td>
+                            <td>
+                              {row.rateSys ?? "—"} / {row.rateFile ?? "—"}
+                            </td>
+                            <td>
+                              {row.grossSys ?? "—"} / {row.grossFile ?? "—"} /{" "}
+                              <span className={deltaClass(row.grossDelta)}>
+                                {row.grossDelta > 0 ? "+" : ""}
+                                {row.grossDelta || 0}
+                              </span>
+                            </td>
+                            <td>{row.tdsFile ?? "—"}</td>
+                            <td style={{ fontWeight: 600 }}>
+                              {row.netFile ?? "—"}
+                            </td>
+                            <td
+                              title={
+                                row.alreadyCreditedCash
+                                  ? "DIVIDEND cash credit recorded for this record date"
+                                  : undefined
+                              }
+                            >
+                              {row.alreadyReceivedGross || 0}
+                            </td>
+                            <td style={{ fontWeight: 600 }}>
+                              {row.toReceiveNet}
+                            </td>
+                            <td>
+                              <span
+                                className={`recon-badge recon-badge-${row.status}`}
+                              >
+                                {STATUS_LABEL[row.status] || row.status}
+                              </span>
+                            </td>
+                          </tr>
+                        ))}
+                    </React.Fragment>
+                  );
+                })}
               </tbody>
             </table>
           </div>
 
           {reconTotalPages > 1 && (
             <div className="dividend-pagination">
+              <button
+                type="button"
+                disabled={page === 1}
+                onClick={() => setPage(1)}
+              >
+                First
+              </button>
               <button
                 type="button"
                 disabled={page === 1}
@@ -938,6 +1092,13 @@ function DividendPage() {
                 onClick={() => setPage(page + 1)}
               >
                 Next
+              </button>
+              <button
+                type="button"
+                disabled={page === reconTotalPages}
+                onClick={() => setPage(reconTotalPages)}
+              >
+                Last
               </button>
             </div>
           )}

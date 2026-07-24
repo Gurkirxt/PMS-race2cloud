@@ -1,5 +1,6 @@
 import { fetchHoldingsRowsForAccountIsin } from "../../util/analytics/holdingsFromTable.js";
 import { parseCustodianCsv } from "../../util/custodian/parseCustodianCsv.js";
+import { buildVirtualToActualMap } from "../../util/mapVirtualToActualCodes.js";
 
 const ZCQL_ROW_LIMIT = 270;
 const ACCOUNT_LOOKUP_BATCH = 50;
@@ -456,10 +457,15 @@ export const getAllSecuritiesISINs = async (req, res) => {
         const accountList = [...accountUnion];
 
         // Already-received and cash-credited lookups (one query each, batched).
-        const [alreadyReceivedMap, cashCreditedSet] = await Promise.all([
-          lookupAlreadyReceived(zcql, isin, recordDateISO, accountList),
-          lookupCashCredited(zcql, isin, recordDateISO, accountList),
-        ]);
+        // virtualToActual resolves each account code to its underlying real
+        // account (Actual_Code). Codes booked directly under an actual code map
+        // to "" and are grouped by their own accountCode on the frontend.
+        const [alreadyReceivedMap, cashCreditedSet, virtualToActual] =
+          await Promise.all([
+            lookupAlreadyReceived(zcql, isin, recordDateISO, accountList),
+            lookupCashCredited(zcql, isin, recordDateISO, accountList),
+            buildVirtualToActualMap(zcql, accountList),
+          ]);
 
         const eventsArr = [];
         const summaryAgg = {
@@ -557,6 +563,7 @@ export const getAllSecuritiesISINs = async (req, res) => {
 
             reconciledRows.push({
               accountCode,
+              actualCode: virtualToActual.get(accountCode) || "",
               clientName: fileRow ? fileRow.clientName : null,
               inFile,
               inSystem,

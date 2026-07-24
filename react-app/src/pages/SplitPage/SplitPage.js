@@ -1,6 +1,6 @@
 
 
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import MainLayout from "../../layouts/MainLayout";
 import { Card } from "../../components/common/CommonComponents";
 import "./SplitPage.css";
@@ -34,14 +34,64 @@ function SplitPage() {
   const PAGE_SIZE = 10;
   const [page, setPage] = useState(1);
 
+  // Which actual-account groups are expanded (drill-down open).
+  const [expandedKeys, setExpandedKeys] = useState(() => new Set());
+
   const dropdownRef = useRef(null);
 
   useEffect(() => setPage(1), [previewData]);
-  const totalPages = Math.max(1, Math.ceil(previewData.length / PAGE_SIZE));
-  const paginatedPreview = previewData.slice(
+
+  /* ===========================
+     GROUP PREVIEW BY ACTUAL ACCOUNT
+     Holdings come back one row per code (WS_Account_code). A single real
+     account can hold shares under many virtual codes AND directly under its
+     actual code, so we fold every code that resolves to the same actual
+     account into one cumulative row and keep the underlying rows as children
+     for the drill-down. Group totals use the same Math.floor the table
+     displays, so a group total equals the visible sum of its children.
+     =========================== */
+  const groupedData = useMemo(() => {
+    const groups = new Map();
+    for (const row of previewData) {
+      const actual = String(row.actualCode || "").trim();
+      const key = actual || row.accountCode;
+      let g = groups.get(key);
+      if (!g) {
+        g = {
+          key,
+          actualCode: actual,
+          currentHolding: 0,
+          newHolding: 0,
+          delta: 0,
+          children: [],
+        };
+        groups.set(key, g);
+      }
+      if (!g.actualCode && actual) g.actualCode = actual;
+      g.currentHolding += Math.floor(Number(row.currentHolding) || 0);
+      g.newHolding += Math.floor(Number(row.newHolding) || 0);
+      g.children.push(row);
+    }
+    for (const g of groups.values()) {
+      g.delta = g.newHolding - g.currentHolding;
+    }
+    return [...groups.values()];
+  }, [previewData]);
+
+  const totalPages = Math.max(1, Math.ceil(groupedData.length / PAGE_SIZE));
+  const paginatedGroups = groupedData.slice(
     (page - 1) * PAGE_SIZE,
     page * PAGE_SIZE,
   );
+
+  const toggleGroup = (key) => {
+    setExpandedKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
 
   /* ===========================
      FETCH ISIN + CODE + NAME
@@ -334,7 +384,6 @@ function SplitPage() {
                 <table className="bonus-preview-table">
                   <thead>
                     <tr>
-                      <th>Virtual Code</th>
                       <th>Actual Code</th>
                       <th>Current Holding</th>
                       <th>New Holding</th>
@@ -342,17 +391,58 @@ function SplitPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {paginatedPreview.map((row, idx) => (
-                      <tr key={(page - 1) * PAGE_SIZE + idx}>
-                        <td>{row.accountCode}</td>
-                        <td>{row.actualCode || "—"}</td>
-                        <td>{Math.floor(Number(row.currentHolding) || 0)}</td>
-                        <td>{Math.floor(Number(row.newHolding) || 0)}</td>
-                        <td className="delta-cell">
-                          {row.delta > 0 ? `+${row.delta}` : row.delta}
-                        </td>
-                      </tr>
-                    ))}
+                    {paginatedGroups.map((group) => {
+                      const isOpen = expandedKeys.has(group.key);
+                      return (
+                        <React.Fragment key={group.key}>
+                          <tr
+                            className="split-group-row"
+                            role="button"
+                            tabIndex={0}
+                            onClick={() => toggleGroup(group.key)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" || e.key === " ") {
+                                e.preventDefault();
+                                toggleGroup(group.key);
+                              }
+                            }}
+                          >
+                            <td>
+                              <span className="split-expand-toggle">
+                                {isOpen ? "▾" : "▸"}
+                              </span>
+                              {group.actualCode || "—"} ({group.children.length})
+                            </td>
+                            <td>{group.currentHolding}</td>
+                            <td>{group.newHolding}</td>
+                            <td className="delta-cell">
+                              {group.delta > 0 ? `+${group.delta}` : group.delta}
+                            </td>
+                          </tr>
+
+                          {isOpen &&
+                            group.children.map((row, cIdx) => (
+                              <tr
+                                key={`${group.key}-${row.accountCode}-${cIdx}`}
+                                className="split-detail-row"
+                              >
+                                <td className="split-detail-code">
+                                  {row.accountCode}
+                                </td>
+                                <td>
+                                  {Math.floor(Number(row.currentHolding) || 0)}
+                                </td>
+                                <td>
+                                  {Math.floor(Number(row.newHolding) || 0)}
+                                </td>
+                                <td className="delta-cell">
+                                  {row.delta > 0 ? `+${row.delta}` : row.delta}
+                                </td>
+                              </tr>
+                            ))}
+                        </React.Fragment>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>

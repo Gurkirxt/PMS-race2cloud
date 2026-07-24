@@ -291,21 +291,49 @@
     font-weight: 600;
   }
 
-  .bonus-preview-table tbody tr:hover {
+  /* Group (collapsed / clickable) rows get the dark-green hover treatment.
+     Detail rows are excluded so a drill-down child doesn't flip to green. */
+  .bonus-preview-table tbody tr.split-group-row {
+    cursor: pointer;
+  }
+
+  .bonus-preview-table tbody tr.split-group-row td {
+    font-weight: 600;
+  }
+
+  .bonus-preview-table tbody tr.split-group-row:hover {
     background: #166534;
   }
 
-  .bonus-preview-table tbody tr:hover td,
-  .bonus-preview-table tbody tr:hover td.delta-cell {
+  .bonus-preview-table tbody tr.split-group-row:hover td,
+  .bonus-preview-table tbody tr.split-group-row:hover td.delta-cell {
     color: #ffffff;
   }
 
-  .bonus-preview-table tbody tr:nth-child(even) {
+  .split-expand-toggle {
+    display: inline-block;
+    width: 16px;
+    color: #6b7280;
+    font-size: 12px;
+    margin-right: 6px;
+  }
+
+  .bonus-preview-table tbody tr.split-group-row:hover .split-expand-toggle {
+    color: #ffffff;
+  }
+
+  /* Drill-down rows: lighter, indented, muted — read as children. */
+  .bonus-preview-table tbody tr.split-detail-row {
     background: #f9fafb;
   }
 
-  .bonus-preview-table tbody tr:nth-child(even):hover {
-    background: #166534;
+  .bonus-preview-table tbody tr.split-detail-row td {
+    color: #6b7280;
+    font-weight: 500;
+  }
+
+  .bonus-preview-table tbody tr.split-detail-row td.split-detail-code {
+    padding-left: 40px;
   }
 
   .bonus-preview-actions {
