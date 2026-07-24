@@ -622,6 +622,52 @@
 }
 
 /* ===========================
+   ACTUAL-ACCOUNT GROUPING + DRILL-DOWN
+   =========================== */
+.dividend-group-row {
+  cursor: pointer;
+}
+
+.dividend-group-row td {
+  font-weight: 500;
+  background: #f8fafc;
+}
+
+.dividend-recon-table tbody tr.dividend-group-row:hover td {
+  background: #eef2f7;
+}
+
+.dividend-expand-toggle {
+  display: inline-block;
+  width: 14px;
+  margin-right: 6px;
+  color: #6b7280;
+  font-size: 11px;
+}
+
+/* Child distribution rows read as nested under their group. */
+.dividend-detail-row td {
+  background: #fcfcfd;
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.dividend-recon-table tbody tr.dividend-detail-row:hover td {
+  background: #f5f6f8;
+}
+
+.dividend-detail-code {
+  padding-left: 32px !important;
+}
+
+/* Status count breakdown on the collapsed group row. */
+.recon-status-breakdown {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+/* ===========================
    APPLY BUTTONS — primary / secondary variants for the v2 dual-button row
    =========================== */
 .dividend-submit-primary {
