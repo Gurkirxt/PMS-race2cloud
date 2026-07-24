@@ -12,11 +12,14 @@ const SYSTEM_FIELDS = ["ROWID", "CREATORID", "CREATEDTIME", "MODIFIEDTIME"];
 /* Business columns intentionally hidden from the table. */
 const HIDDEN_FIELDS = ["WS_client_id"];
 const ACCOUNT_FIELD = "WS_Account_code";
-/* Search filters on the virtual account code. */
-const SEARCH_FIELD = "WS_Account_code";
+const VIRTUAL_FIELD = "WS_Account_code";
+const ACTUAL_FIELD = "Actual_Code";
 
 /* Header overrides — data key stays the same, only the displayed label changes. */
-const COLUMN_LABELS = { WS_Account_code: "Virtual Code" };
+const COLUMN_LABELS = {
+  WS_Account_code: "Virtual Code",
+  Actual_Code: "Actual Code",
+};
 
 /* "WS_Account_code" -> "WS Account Code" */
 function prettyLabel(key) {
@@ -88,13 +91,15 @@ function ClientPage() {
     );
   }, [clients]);
 
-  /* The search box filters the table by WS_Account_code (virtual code). */
+  /* Single search: match virtual code OR actual code (actual → all related virtuals). */
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return clients;
-    return clients.filter((r) =>
-      String(r[SEARCH_FIELD] ?? "").toLowerCase().includes(q)
-    );
+    return clients.filter((r) => {
+      const virtual = String(r[VIRTUAL_FIELD] ?? "").toLowerCase();
+      const actual = String(r[ACTUAL_FIELD] ?? "").toLowerCase();
+      return virtual.includes(q) || actual.includes(q);
+    });
   }, [clients, search]);
 
   /* Reset to the first page whenever the filter changes. */
@@ -113,12 +118,12 @@ function ClientPage() {
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
-  /* Autocomplete suggestions — distinct virtual codes (deduped) from the matches. */
+  /* Autocomplete — distinct virtual codes from matches (includes actual-code hits). */
   const suggestions = useMemo(() => {
     const seen = new Set();
     const out = [];
     for (const r of filtered) {
-      const code = String(r[SEARCH_FIELD] ?? "").trim();
+      const code = String(r[VIRTUAL_FIELD] ?? "").trim();
       if (code && !seen.has(code)) {
         seen.add(code);
         out.push(code);
@@ -152,7 +157,7 @@ function ClientPage() {
                   <input
                     type="text"
                     className="search-input"
-                    placeholder="Search Virtual Code..."
+                    placeholder="Search Virtual or Actual Code..."
                     value={search}
                     onChange={(e) => {
                       setSearch(e.target.value);
