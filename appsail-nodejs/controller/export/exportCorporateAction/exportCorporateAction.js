@@ -1,9 +1,18 @@
 // appsail-nodejs/controller/export/exportCorporateAction/exportCorporateAction.js
 
 const BATCH_SIZE = 200;
-const HISTORY_LIMIT = 10;
 
-const exportHistory = [];
+const esc = (s) => String(s ?? "").replace(/'/g, "''");
+
+const parseCatalystTime = (ct) => {
+  if (!ct) return 0;
+  // Catalyst CREATEDTIME is an IST (UTC+05:30) wall-clock string like
+  // "2026-06-19 17:41:28:675". Parse explicitly as IST so the AppSail server's
+  // own timezone (UTC) doesn't shift it +5:30.
+  const iso = String(ct).trim().replace(" ", "T").replace(/:(\d{3})$/, ".$1");
+  const ms = new Date(`${iso}+05:30`).getTime();
+  return isNaN(ms) ? 0 : ms;
+};
 
 /** Query param → yyyy-mm-dd without shifting calendar day when value is already ISO date. */
 function toIsoDateParam(raw) {
@@ -36,8 +45,39 @@ function pickFirstDefined(obj, keys) {
 
 export const getCorporateActionHistory = async (req, res) => {
   try {
+    if (!req.catalystApp) {
+      return res.status(500).json([]);
+    }
+
     const limit = Math.min(parseInt(req.query.limit, 10) || 10, 20);
-    const list = exportHistory.slice(0, limit);
+    const zcql = req.catalystApp.zcql();
+
+    const rows = await zcql.executeZCQLQuery(
+      `SELECT jobName, status, CREATEDTIME FROM Jobs WHERE jobName LIKE 'CAALL_*' ORDER BY ROWID DESC LIMIT ${limit}`
+    );
+
+    const list = rows.map((row) => {
+      const jobName = row.Jobs.jobName;
+      const status = row.Jobs.status;
+      const createdAtMs = parseCatalystTime(row.Jobs.CREATEDTIME);
+
+      // jobName shape: CAALL_<fromISO>_<toISO>_<epochMs>
+      const parts = jobName.split("_");
+      const fromDate = parts[1] || "";
+      const toDate = parts[2] || "";
+
+      return {
+        jobName,
+        fromDate,
+        toDate,
+        status,
+        createdAt:
+          createdAtMs > 0
+            ? new Date(createdAtMs).toISOString()
+            : new Date().toISOString(),
+      };
+    });
+
     return res.json(list);
   } catch (err) {
     console.error("CORPORATE ACTION HISTORY ERROR:", err);
@@ -392,13 +432,16 @@ export const exportCorporateAction = async (req, res) => {
         .join(",") + "\n";
     }
 
-    /* ---------- STORE IN HISTORY (last 10) ---------- */
-    exportHistory.unshift({
-      fromDate: fromISO,
-      toDate: toISO,
-      requestedAt: new Date().toISOString(),
-    });
-    if (exportHistory.length > HISTORY_LIMIT) exportHistory.pop();
+    /* ---------- PERSIST TO HISTORY (Jobs table, survives restarts) ---------- */
+    try {
+      const jobName = `CAALL_${fromISO}_${toISO}_${Date.now()}`;
+      await zcql.executeZCQLQuery(
+        `INSERT INTO Jobs (jobName, status) VALUES ('${esc(jobName)}', 'COMPLETED')`
+      );
+    } catch (historyErr) {
+      // Don't fail the export just because the history row couldn't be written.
+      console.error("CORPORATE ACTION HISTORY WRITE ERROR:", historyErr);
+    }
 
     /* ---------- RETURN CSV DIRECTLY (same-origin download, no signed URL) ---------- */
     const fileName = `corporate-action-export-${fromISO}-${toISO}.csv`;

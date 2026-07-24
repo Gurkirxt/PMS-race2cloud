@@ -14,6 +14,12 @@ import {
   getCorporateActionHistory,
 } from "../../controller/export/exportCorporateAction/exportCorporateAction.js";
 import {
+  startCaImpactReport,
+  getCaImpactStatus,
+  downloadCaImpactReport,
+  getCaImpactHistory,
+} from "../../controller/export/exportCorporateAction/exportCaImpactReport.js";
+import {
   exportAllClientsCash,
   getAllClientsCashExportStatus,
   downloadAllClientsCashExport,
@@ -40,5 +46,11 @@ router.get("/transaction/export-single", exportTransactionPerAccount);
 // corporate action export (fromDate, toDate)
 router.get("/corporate-action/export", exportCorporateAction);
 router.get("/corporate-action/history", getCorporateActionHistory);
+
+// corporate action per-client impact report (type, fromDate, toDate) — async job
+router.get("/corporate-action/report/export", startCaImpactReport);
+router.get("/corporate-action/report/status", getCaImpactStatus);
+router.get("/corporate-action/report/download", downloadCaImpactReport);
+router.get("/corporate-action/report/history", getCaImpactHistory);
 
 export default router;

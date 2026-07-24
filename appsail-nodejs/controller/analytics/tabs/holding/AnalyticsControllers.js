@@ -180,6 +180,17 @@ export const calculateHoldingsByIsin = async ({
   if (!isinTrim) return [];
 
   const clause = holdingsDateFilterClause(asOnDate);
+
+  // Precompute the exclusive next-day cutoff so we can refine the loose SQL OR
+  // clause per row (buys settle on SETTLEMENT_DATE, others on TRANSACTION_DATE).
+  const trimmedAsOn = String(asOnDate ?? "").trim();
+  let cutoff = "";
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmedAsOn)) {
+    const nextDay = new Date(trimmedAsOn);
+    nextDay.setDate(nextDay.getDate() + 1);
+    cutoff = nextDay.toISOString().split("T")[0];
+  }
+
   const latestByAccount = new Map();
   let offset = 0;
 
@@ -200,23 +211,22 @@ export const calculateHoldingsByIsin = async ({
       const row = r.Holdings || r;
       const accountCode = String(row.WS_Account_code ?? "").trim();
       if (!accountCode) continue;
+
+      // Filter each row by effective date BEFORE it can become the account's
+      // "latest" snapshot. Without this, a not-yet-settled buy (or a post-date
+      // sell) that leaks through the loose SQL clause would overwrite — and then
+      // wrongly drop — the account's real earlier holding. Mirrors the row-first
+      // filter in fetchHoldingsRowsPaged so this matches the per-account summary.
+      if (cutoff) {
+        const d = holdingsEffectiveDate(row);
+        if (d && d >= cutoff) continue;
+      }
+
       latestByAccount.set(accountCode, row);
     }
 
     if (batch.length < HOLDINGS_BATCH) break;
     offset += HOLDINGS_BATCH;
-  }
-
-  const trimmedAsOn = String(asOnDate ?? "").trim();
-  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmedAsOn)) {
-    const nextDay = new Date(trimmedAsOn);
-    nextDay.setDate(nextDay.getDate() + 1);
-    const cutoff = nextDay.toISOString().split("T")[0];
-
-    for (const [acc, row] of latestByAccount.entries()) {
-      const d = holdingsEffectiveDate(row);
-      if (d && d >= cutoff) latestByAccount.delete(acc);
-    }
   }
 
   if (latestByAccount.size === 0) return [];
